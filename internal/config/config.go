@@ -191,6 +191,13 @@ func (c *Config) GenerateSelfSignedCert() error {
 		return fmt.Errorf("failed to generate private key: %w", err)
 	}
 
+	// Get all local IP addresses
+	localIPs, err := getLocalIPAddresses()
+	if err != nil {
+		fmt.Printf("Warning: Could not detect local IPs, using defaults: %v\n", err)
+		localIPs = []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
+	}
+
 	// Create certificate template
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
@@ -207,18 +214,31 @@ func (c *Config) GenerateSelfSignedCert() error {
 		NotAfter:    time.Now().Add(365 * 24 * time.Hour), // Valid for 1 year
 		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+		IPAddresses: localIPs,
 		DNSNames:    []string{"localhost", "hTranscode-server"},
 	}
 
 	// Add public address if specified
 	if c.Remote.PublicAddress != "" {
 		if ip := net.ParseIP(c.Remote.PublicAddress); ip != nil {
-			template.IPAddresses = append(template.IPAddresses, ip)
+			// Check if it's not already in the list
+			found := false
+			for _, existingIP := range template.IPAddresses {
+				if existingIP.Equal(ip) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				template.IPAddresses = append(template.IPAddresses, ip)
+			}
 		} else {
 			template.DNSNames = append(template.DNSNames, c.Remote.PublicAddress)
 		}
 	}
+
+	fmt.Printf("Certificate will include IPs: %v\n", template.IPAddresses)
+	fmt.Printf("Certificate will include DNS names: %v\n", template.DNSNames)
 
 	// Generate certificate
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
@@ -261,6 +281,55 @@ func (c *Config) GenerateSelfSignedCert() error {
 	fmt.Printf("Generated private key: %s\n", c.TLS.KeyFile)
 
 	return nil
+}
+
+// getLocalIPAddresses returns all local IP addresses
+func getLocalIPAddresses() ([]net.IP, error) {
+	var ips []net.IP
+
+	// Always include localhost
+	ips = append(ips, net.IPv4(127, 0, 0, 1), net.IPv6loopback)
+
+	// Get all network interfaces
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ips, err
+	}
+
+	for _, iface := range interfaces {
+		// Skip loopback and down interfaces
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		// Get addresses for this interface
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			// Skip if not a valid unicast IP
+			if ip == nil || ip.IsLoopback() || ip.IsMulticast() {
+				continue
+			}
+
+			// Add IPv4 and IPv6 addresses
+			if ip.To4() != nil || ip.To16() != nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+
+	return ips, nil
 }
 
 // SetupTLS configures TLS for the server
