@@ -1,0 +1,184 @@
+@import "tailwindcss";
+@source "../**/*.html";
+
+/* shadcn/ui inspired dark theme with green accent */
+@theme {
+  /* Background colors */
+  --color-background: #0a0a0a;
+  --color-foreground: #fafafa;
+  --color-card: #0a0a0a;
+  --color-card-foreground: #fafafa;
+  --color-popover: #0a0a0a;
+  --color-popover-foreground: #fafafa;
+
+  /* Primary (Green) */
+  --color-primary: #22c55e;
+  --color-primary-foreground: #0f172a;
+
+  /* Secondary */
+  --color-secondary: #27272a;
+  --color-secondary-foreground: #fafafa;
+
+  /* Muted */
+  --color-muted: #27272a;
+  --color-muted-foreground: #a1a1aa;
+
+  /* Accent */
+  --color-accent: #27272a;
+  --color-accent-foreground: #fafafa;
+
+  /* Destructive */
+  --color-destructive: #dc2626;
+  --color-destructive-foreground: #fafafa;
+
+  /* Border */
+  --color-border: #27272a;
+  --color-input: #27272a;
+
+  /* Ring */
+  --color-ring: #22c55e;
+
+  /* Chart colors */
+  --color-chart-1: #3b82f6;
+  --color-chart-2: #10b981;
+  --color-chart-3: #f59e0b;
+  --color-chart-4: #8b5cf6;
+  --color-chart-5: #f97316;
+}
+
+/* Base styles following shadcn/ui patterns */
+:root {
+  background-color: #0a0a0a;
+  color: #fafafa;
+}
+
+body {
+  background-color: #0a0a0a;
+  color: #fafafa;
+  font-feature-settings: "rlig" 1, "calt" 1;
+}
+
+/* Custom component classes inspired by shadcn/ui */
+.card {
+  @apply rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-50 shadow-sm;
+}
+
+.button {
+  @apply inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-500 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50;
+}
+
+.button-primary {
+  @apply bg-green-600 text-white hover:bg-green-700;
+}
+
+.button-secondary {
+  @apply bg-zinc-800 text-zinc-50 hover:bg-zinc-700;
+}
+
+.button-outline {
+  @apply border border-zinc-800 bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-50;
+}
+
+.input {
+  @apply flex h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-50 placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50;
+}
+
+.badge {
+  @apply inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2;
+}
+
+.badge-default {
+  @apply border-transparent bg-green-600 text-white hover:bg-green-700;
+}
+
+.badge-secondary {
+  @apply border-transparent bg-zinc-800 text-zinc-50 hover:bg-zinc-700;
+}
+
+.badge-destructive {
+  @apply border-transparent bg-red-600 text-white hover:bg-red-700;
+}
+
+.badge-outline {
+  @apply text-zinc-50 border-zinc-800;
+}
+
+/* Status-specific badges */
+.badge-success {
+  @apply border-transparent bg-green-600 text-white hover:bg-green-700;
+}
+
+.badge-warning {
+  @apply border-transparent bg-yellow-600 text-white hover:bg-yellow-700;
+}
+
+.badge-error {
+  @apply border-transparent bg-red-600 text-white hover:bg-red-700;
+}
+
+.badge-info {
+  @apply border-transparent bg-blue-600 text-white hover:bg-blue-700;
+}
+
+/* Background and text utilities */
+.bg-background { @apply bg-zinc-950; }
+.bg-foreground { @apply bg-zinc-50; }
+.bg-card { @apply bg-zinc-950; }
+.bg-card-foreground { @apply bg-zinc-50; }
+.bg-popover { @apply bg-zinc-950; }
+.bg-popover-foreground { @apply bg-zinc-50; }
+.bg-primary { @apply bg-green-600; }
+.bg-primary-foreground { @apply bg-white; }
+.bg-secondary { @apply bg-zinc-800; }
+.bg-secondary-foreground { @apply bg-zinc-50; }
+.bg-muted { @apply bg-zinc-800; }
+.bg-muted-foreground { @apply bg-zinc-400; }
+.bg-accent { @apply bg-zinc-800; }
+.bg-accent-foreground { @apply bg-zinc-50; }
+.bg-destructive { @apply bg-red-600; }
+.bg-destructive-foreground { @apply bg-white; }
+.bg-border { @apply bg-zinc-800; }
+.bg-input { @apply bg-zinc-800; }
+.bg-ring { @apply bg-green-600; }
+
+.text-background { @apply text-zinc-950; }
+.text-foreground { @apply text-zinc-50; }
+.text-card { @apply text-zinc-950; }
+.text-card-foreground { @apply text-zinc-50; }
+.text-popover { @apply text-zinc-950; }
+.text-popover-foreground { @apply text-zinc-50; }
+.text-primary { @apply text-green-600; }
+.text-primary-foreground { @apply text-white; }
+.text-secondary { @apply text-zinc-800; }
+.text-secondary-foreground { @apply text-zinc-50; }
+.text-muted { @apply text-zinc-800; }
+.text-muted-foreground { @apply text-zinc-400; }
+.text-accent { @apply text-zinc-800; }
+.text-accent-foreground { @apply text-zinc-50; }
+.text-destructive { @apply text-red-600; }
+.text-destructive-foreground { @apply text-white; }
+.text-border { @apply text-zinc-800; }
+.text-input { @apply text-zinc-800; }
+.text-ring { @apply text-green-600; }
+
+.border-background { @apply border-zinc-950; }
+.border-foreground { @apply border-zinc-50; }
+.border-card { @apply border-zinc-950; }
+.border-card-foreground { @apply border-zinc-50; }
+.border-popover { @apply border-zinc-950; }
+.border-popover-foreground { @apply border-zinc-50; }
+.border-primary { @apply border-green-600; }
+.border-primary-foreground { @apply border-white; }
+.border-secondary { @apply border-zinc-800; }
+.border-secondary-foreground { @apply border-zinc-50; }
+.border-muted { @apply border-zinc-800; }
+.border-muted-foreground { @apply border-zinc-400; }
+.border-accent { @apply border-zinc-800; }
+.border-accent-foreground { @apply border-zinc-50; }
+.border-destructive { @apply border-red-600; }
+.border-destructive-foreground { @apply border-white; }
+.border-border { @apply border-zinc-800; }
+.border-input { @apply border-zinc-800; }
+.border-ring { @apply border-green-600; }
+
+/* Custom styles can be added here */ 

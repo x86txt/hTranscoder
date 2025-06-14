@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="business">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>hTranscode - Distributed Video Transcoding</title>
+    <link href="/static/styles.css" rel="stylesheet">
+</head>
+<body class="bg-base-200 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <!-- Header -->
+        <header class="mb-8">
+            <h1 class="text-4xl font-bold text-base-content mb-2">hTranscode</h1>
+            <p class="text-base-content/70">Distributed Video Transcoding System</p>
+        </header>
+
+        <!-- Worker Status -->
+        <div class="bg-base-100 rounded-lg shadow-md p-6">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-2xl font-semibold text-base-content">Worker Status</h2>
+                <div class="text-sm text-base-content/70">
+                    <span id="workerCount">0</span> workers connected
+                </div>
+            </div>
+            <div id="workerStatus" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div class="bg-base-200 rounded p-4">
+                    <p class="text-sm text-base-content/70">No workers connected</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+
+        // Initialize WebSocket connection
+        function initWebSocket() {
+            // Automatically detect protocol and construct WebSocket URL
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.host;
+            const wsUrl = `${protocol}//${host}/ws`;
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                console.log('WebSocket connected to:', wsUrl);
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                console.log('WebSocket message:', data);
+            };
+            
+            ws.onclose = function() {
+                console.log('WebSocket disconnected');
+                // Reconnect after 3 seconds
+                setTimeout(initWebSocket, 3000);
+            };
+        }
+
+        // Fetch worker status from API
+        function fetchWorkerStatus() {
+            fetch('/api/workers')
+                .then(response => response.json())
+                .then(workers => {
+                    console.log('Fetched workers:', workers);
+                    updateWorkerStatus(workers);
+                })
+                .catch(error => {
+                    console.error('Error fetching worker status:', error);
+                });
+        }
+
+        function updateWorkerStatus(workers) {
+            const workerStatus = document.getElementById('workerStatus');
+            const workerCount = document.getElementById('workerCount');
+            
+            workerStatus.innerHTML = '';
+            workerCount.textContent = workers.length;
+            
+            if (workers.length === 0) {
+                workerStatus.innerHTML = `
+                    <div class="bg-base-200 rounded p-4">
+                        <p class="text-sm text-base-content/70">No workers connected</p>
+                    </div>
+                `;
+            } else {
+                workers.forEach(worker => {
+                    const statusColors = {
+                        'online': 'badge-success',
+                        'idle': 'badge-info',
+                        'busy': 'badge-warning',
+                        'offline': 'badge-error'
+                    };
+                    const statusColor = statusColors[worker.status] || 'badge-neutral';
+                    
+                    const workerElement = document.createElement('div');
+                    workerElement.className = 'bg-base-200 rounded p-4 relative';
+                    workerElement.innerHTML = `
+                        <div class="absolute top-2 right-2">
+                            <span class="badge ${statusColor} badge-sm">
+                                ${worker.status}
+                            </span>
+                        </div>
+                        <h4 class="font-medium text-base-content mb-2 pr-16">${worker.name}</h4>
+                        <div class="space-y-1">
+                            <p class="text-sm text-base-content/70">IP: ${worker.ipAddress || 'Unknown'}</p>
+                            <p class="text-sm text-base-content/70">Latency: ${worker.latency || 0}ms</p>
+                            <p class="text-sm text-base-content/70">Jobs: ${worker.currentJobs}/${worker.maxJobs}</p>
+                            <p class="text-sm text-base-content/70">CPU: ${worker.cpu || 'Available'}</p>
+                            <p class="text-sm text-base-content/70">GPU: ${worker.gpu || 'None'}</p>
+                        </div>
+                    `;
+                    
+                    workerStatus.appendChild(workerElement);
+                });
+            }
+        }
+
+        // Initialize on page load
+        window.onload = function() {
+            console.log('Initializing simple worker status page');
+            initWebSocket();
+            fetchWorkerStatus();
+            
+            // Fetch worker status every 5 seconds
+            setInterval(fetchWorkerStatus, 5000);
+        };
+    </script>
+</body>
+</html> 

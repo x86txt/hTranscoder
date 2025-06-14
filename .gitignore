@@ -1,0 +1,68 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Compiled binaries
+htranscode
+worker
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+
+# Air temporary files
+tmp/
+
+# Tailwind CSS binary (downloaded separately)
+bin/tailwind/tailwindcss
+
+# Generated CSS files
+cmd/static/styles.css
+
+# IDE specific files
+.vscode/
+.idea/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+
+# Log files
+*.log
+
+# Secret key files and certificates
+.htranscode.key
+htranscode.crt
+htranscode.key
+
+# Transcoded output files
+transcoded/
+
+# Uploaded video cache
+.htranscode/
+
+# Video files
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.flv
+*.wmv
+*.webm
+*.m4v
+*.3gp
