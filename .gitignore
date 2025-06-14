@@ -5,10 +5,10 @@
 *.so
 *.dylib
 
-# Compiled binaries
-htranscode
-worker
-api
+# Compiled binaries (exact matches in root directory)
+./htranscode
+./worker
+./api
 
 # Test binary, built with `go test -c`
 *.test
