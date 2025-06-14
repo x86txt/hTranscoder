@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"hTranscode/internal/models"
@@ -38,6 +40,13 @@ type Client struct {
 
 // NewClient creates a new worker client
 func NewClient(name, serverURL string, maxJobs int, gpu bool) *Client {
+	// Set retry interval based on operating system
+	// Windows needs longer retry intervals due to stricter socket management
+	retryInterval := 2 * time.Second
+	if runtime.GOOS == "windows" {
+		retryInterval = 5 * time.Second
+	}
+
 	client := &Client{
 		ID:            fmt.Sprintf("worker_%d", time.Now().Unix()),
 		Name:          name,
@@ -46,7 +55,7 @@ func NewClient(name, serverURL string, maxJobs int, gpu bool) *Client {
 		done:          make(chan bool),
 		MaxJobs:       maxJobs,
 		GPU:           gpu,
-		retryInterval: 2 * time.Second,
+		retryInterval: retryInterval,
 		maxRetries:    -1,             // Retry indefinitely
 		outputDir:     "./transcoded", // Default output directory
 	}
@@ -112,12 +121,40 @@ func (c *Client) Connect() error {
 	}
 	u.Path = "/ws"
 
-	// Create WebSocket dialer with TLS config for self-signed certificates
+	// Create HTTP transport with Windows-optimized settings
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Accept self-signed certificates
+		},
+		// Windows-specific socket optimization
+		DisableKeepAlives:   false,
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     30 * time.Second,
+	}
+
+	// For Windows, configure socket reuse options
+	if runtime.GOOS == "windows" {
+		transport.DisableKeepAlives = true // Disable keep-alives on Windows
+		transport.MaxIdleConns = 0         // Don't pool connections
+		transport.IdleConnTimeout = 1 * time.Second
+	}
+
+	// Create WebSocket dialer with optimized settings
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true, // Accept self-signed certificates
 		},
-		HandshakeTimeout: 10 * time.Second,
+		HandshakeTimeout:  15 * time.Second, // Increased timeout for Windows
+		EnableCompression: false,            // Disable compression to reduce overhead
+		NetDial: func(network, addr string) (net.Conn, error) {
+			// Use a custom dialer for better control
+			d := &net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}
+			return d.Dial(network, addr)
+		},
 	}
 
 	log.Printf("Connecting to %s from %s", u.String(), c.ipAddress)
@@ -127,6 +164,10 @@ func (c *Client) Connect() error {
 	}
 
 	c.conn = conn
+
+	// Set connection timeouts and options
+	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
 	// Determine GPU status
 	gpuStatus := GetGPUStatus()
@@ -196,10 +237,24 @@ func (c *Client) connectAndRun() error {
 	if err := c.Connect(); err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
+
+	// Improved connection cleanup
 	defer func() {
 		if c.conn != nil {
+			// Send close message before closing connection
+			closeMessage := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+			c.conn.WriteMessage(websocket.CloseMessage, closeMessage)
+
+			// Give time for close message to be sent
+			time.Sleep(100 * time.Millisecond)
+
 			c.conn.Close()
 			c.conn = nil
+
+			// On Windows, give additional time for socket cleanup
+			if runtime.GOOS == "windows" {
+				time.Sleep(500 * time.Millisecond)
+			}
 		}
 	}()
 
@@ -221,8 +276,16 @@ func (c *Client) connectAndRun() error {
 			log.Println("Worker shutdown requested during message loop")
 			return nil
 		default:
+			// Set read deadline for each message
+			c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
 			var msg models.WorkerMessage
 			if err := c.conn.ReadJSON(&msg); err != nil {
+				// Check if it's a close error (normal shutdown)
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					log.Println("Connection closed normally")
+					return nil
+				}
 				return fmt.Errorf("read error: %w", err)
 			}
 
@@ -263,6 +326,10 @@ func (c *Client) connectAndRun() error {
 					Type:    "pong",
 					Payload: c.ID,
 				}
+
+				// Set write deadline before sending pong
+				c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
 				if err := c.conn.WriteJSON(pong); err != nil {
 					log.Printf("Failed to send pong: %v", err)
 					return fmt.Errorf("failed to send pong: %w", err)
@@ -456,6 +523,11 @@ func getPresetFromJob(job *models.ChunkJob) string {
 
 // sendJobStatus sends job status update to the master server
 func (c *Client) sendJobStatus(job *models.ChunkJob, status string, progress int, error string) {
+	if c.conn == nil {
+		log.Printf("Cannot send job status: connection is nil")
+		return
+	}
+
 	update := models.WorkerMessage{
 		Type: "chunk_status",
 		Payload: map[string]interface{}{
@@ -468,6 +540,9 @@ func (c *Client) sendJobStatus(job *models.ChunkJob, status string, progress int
 			"workerId":   c.ID,
 		},
 	}
+
+	// Set write deadline
+	c.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
 	if err := c.conn.WriteJSON(update); err != nil {
 		log.Printf("Failed to send job status: %v", err)
@@ -482,6 +557,12 @@ func (c *Client) heartbeat(done chan bool) {
 	for {
 		select {
 		case <-ticker.C:
+			// Check if connection is still valid
+			if c.conn == nil {
+				log.Println("Heartbeat stopping: connection is nil")
+				return
+			}
+
 			// Record time for latency calculation
 			pingTime := time.Now()
 
@@ -501,6 +582,9 @@ func (c *Client) heartbeat(done chan bool) {
 					"networkSpeed": usageStats.NetworkSpeed,
 				},
 			}
+
+			// Set write deadline before sending heartbeat
+			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
 			if err := c.conn.WriteJSON(status); err != nil {
 				log.Printf("Failed to send heartbeat: %v", err)
