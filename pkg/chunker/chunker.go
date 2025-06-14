@@ -11,7 +11,8 @@ import (
 
 // VideoChunker handles splitting videos into chunks
 type VideoChunker struct {
-	ChunkDuration int // Duration of each chunk in seconds
+	ChunkDuration int // Duration of each chunk in seconds (for duration-based splitting)
+	NumChunks     int // Number of chunks to create (for count-based splitting)
 }
 
 // NewVideoChunker creates a new VideoChunker instance
@@ -21,6 +22,16 @@ func NewVideoChunker(chunkDuration int) *VideoChunker {
 	}
 	return &VideoChunker{
 		ChunkDuration: chunkDuration,
+	}
+}
+
+// NewVideoChunkerByCount creates a new VideoChunker instance for count-based splitting
+func NewVideoChunkerByCount(numChunks int) *VideoChunker {
+	if numChunks <= 0 {
+		numChunks = 1 // Default to 1 chunk
+	}
+	return &VideoChunker{
+		NumChunks: numChunks,
 	}
 }
 
@@ -101,6 +112,67 @@ func (vc *VideoChunker) SplitVideo(videoPath string, outputDir string, jobID str
 
 		// Adjust duration for last chunk
 		if start+duration > info.Duration {
+			duration = info.Duration - start
+		}
+
+		chunkPath := filepath.Join(outputDir, fmt.Sprintf("%s_chunk_%03d.mp4", jobID, i))
+
+		// Use ffmpeg to extract chunk
+		cmd := exec.Command("ffmpeg",
+			"-i", videoPath,
+			"-ss", fmt.Sprintf("%.2f", start),
+			"-t", fmt.Sprintf("%.2f", duration),
+			"-c", "copy", // Copy codec to avoid re-encoding during split
+			"-avoid_negative_ts", "make_zero",
+			chunkPath,
+		)
+
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("failed to create chunk %d: %w", i, err)
+		}
+
+		chunks = append(chunks, Chunk{
+			ID:       fmt.Sprintf("%s_%03d", jobID, i),
+			Index:    i,
+			Path:     chunkPath,
+			Start:    start,
+			Duration: duration,
+		})
+	}
+
+	return chunks, nil
+}
+
+// SplitVideoByChunks splits a video into a specific number of equal-duration chunks
+func (vc *VideoChunker) SplitVideoByChunks(videoPath string, outputDir string, jobID string, numChunks int) ([]Chunk, error) {
+	// Get video info
+	info, err := vc.GetVideoInfo(videoPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create output directory
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	// Ensure we have at least 1 chunk
+	if numChunks <= 0 {
+		numChunks = 1
+	}
+
+	// Calculate chunk duration
+	chunkDuration := info.Duration / float64(numChunks)
+
+	chunks := make([]Chunk, 0, numChunks)
+
+	// Split video into chunks
+	for i := 0; i < numChunks; i++ {
+		start := float64(i) * chunkDuration
+		duration := chunkDuration
+
+		// Adjust duration for last chunk to ensure we get the entire video
+		if i == numChunks-1 {
 			duration = info.Duration - start
 		}
 

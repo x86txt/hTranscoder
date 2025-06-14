@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"hTranscode/internal/config"
@@ -34,10 +33,9 @@ var (
 	}
 
 	workerManager *manager.WorkerManager
+	jobManager    *manager.JobManager
 	secretKey     string
 	appConfig     *config.Config
-	activeJobs    = make(map[string]*EncodeJob) // Track active jobs
-	jobsMutex     sync.RWMutex                  // Protect jobs map
 )
 
 type VideoFile struct {
@@ -46,13 +44,6 @@ type VideoFile struct {
 	Size       int64  `json:"size"`
 	Duration   string `json:"duration"`
 	IsUploaded bool   `json:"isUploaded"`
-}
-
-type EncodeJob struct {
-	ID        string `json:"id"`
-	VideoPath string `json:"videoPath"`
-	Status    string `json:"status"`
-	Progress  int    `json:"progress"`
 }
 
 type UploadResponse struct {
@@ -97,6 +88,9 @@ func main() {
 
 	// Initialize worker manager
 	workerManager = manager.NewWorkerManager()
+
+	// Initialize job manager
+	jobManager = manager.NewJobManager(workerManager, appConfig.Storage.TempCacheDir, "./transcoded")
 
 	// Load or generate secret key
 	secretKey, err = loadOrGenerateKey(*keyFile)
@@ -309,103 +303,26 @@ func encodeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create encode job
-	job := EncodeJob{
-		ID:        generateJobID(),
-		VideoPath: request.VideoPath,
-		Status:    "queued",
-		Progress:  0,
+	// Create encode settings
+	settings := &models.EncodeSettings{
+		Codec:      "h264",
+		Bitrate:    "10M",
+		Resolution: "1080p",
+		Preset:     request.Preset,
+		GPU:        appConfig.Hardware.UseGPU,
 	}
 
-	// Store job in active jobs
-	jobsMutex.Lock()
-	activeJobs[job.ID] = &job
-	jobsMutex.Unlock()
-
-	log.Printf("Created encoding job: %s for video: %s", job.ID, request.VideoPath)
-
-	// Try to assign job to an available worker
-	assignJobToWorker(&job)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(job)
-}
-
-// assignJobToWorker assigns a job to an available worker
-func assignJobToWorker(job *EncodeJob) {
-	availableWorkers := workerManager.GetAvailableWorkers()
-	if len(availableWorkers) == 0 {
-		log.Printf("No available workers for job %s, job remains queued", job.ID)
+	// Create job using JobManager
+	job, err := jobManager.CreateJob(request.VideoPath, settings)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create job: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Get the first available worker
-	worker := availableWorkers[0]
+	log.Printf("Created encoding job: %s for video: %s", job.ID, request.VideoPath)
 
-	log.Printf("Assigning job %s to worker %s", job.ID, worker.Worker.ID)
-
-	// Update job status
-	jobsMutex.Lock()
-	job.Status = "processing"
-	jobsMutex.Unlock()
-
-	// Create chunk job for the worker (simplified - treating whole video as one chunk)
-	chunkJob := models.ChunkJob{
-		ID:         fmt.Sprintf("%s_chunk_0", job.ID),
-		JobID:      job.ID,
-		ChunkIndex: 0,
-		InputPath:  job.VideoPath,
-		OutputPath: generateOutputPath(job.VideoPath),
-		WorkerID:   worker.Worker.ID,
-		Status:     models.ChunkStatusPending,
-		Progress:   0,
-		Settings: &models.EncodeSettings{
-			Codec:      "h264",
-			Bitrate:    "10M",
-			Resolution: "1080p",
-			Preset:     "medium",
-			GPU:        worker.Worker.GPU != "",
-		},
-	}
-
-	// Send chunk job to worker
-	message := models.WorkerMessage{
-		Type:    "chunk_job",
-		Payload: chunkJob,
-	}
-
-	if err := workerManager.SendToWorker(worker.Worker.ID, &message); err != nil {
-		log.Printf("Failed to send job to worker %s: %v", worker.Worker.ID, err)
-		// Reset job status if sending failed
-		jobsMutex.Lock()
-		job.Status = "queued"
-		jobsMutex.Unlock()
-	} else {
-		log.Printf("Successfully sent job %s to worker %s", job.ID, worker.Worker.ID)
-	}
-}
-
-// generateOutputPath creates an output path for the encoded video
-func generateOutputPath(inputPath string) string {
-	// Create output directory if it doesn't exist
-	outputDir := "./transcoded"
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		log.Printf("Warning: Could not create output directory %s: %v", outputDir, err)
-		// Fall back to same directory as input
-		dir := filepath.Dir(inputPath)
-		base := filepath.Base(inputPath)
-		ext := filepath.Ext(base)
-		name := strings.TrimSuffix(base, ext)
-		return filepath.Join(dir, fmt.Sprintf("%s_encoded%s", name, ext))
-	}
-
-	// Generate output filename in dedicated directory
-	base := filepath.Base(inputPath)
-	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
-
-	// Add encoding parameters to filename for clarity
-	return filepath.Join(outputDir, fmt.Sprintf("%s_transcoded_h264_10M.mp4", name))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(job)
 }
 
 func workersHandler(w http.ResponseWriter, r *http.Request) {
@@ -538,13 +455,25 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 			// Parse chunk status data
 			statusData, ok := msg.Payload.(map[string]interface{})
 			if ok {
-				if jobID, ok := statusData["jobId"].(string); ok {
+				chunkID, _ := statusData["chunkId"].(string)
+				if chunkID == "" {
+					// Fallback to id for backward compatibility
+					chunkID, _ = statusData["id"].(string)
+				}
+				if chunkID == "" {
+					// Fallback to jobId for backward compatibility
+					chunkID, _ = statusData["jobId"].(string)
+				}
+
+				if chunkID != "" {
 					status, _ := statusData["status"].(string)
 					progress, _ := statusData["progress"].(float64)
 					errorMsg, _ := statusData["error"].(string)
 
-					// Update job progress
-					updateJobProgress(jobID, status, int(progress), errorMsg)
+					// Update chunk progress using JobManager
+					if err := jobManager.UpdateChunkProgress(chunkID, status, int(progress), errorMsg); err != nil {
+						log.Printf("Failed to update chunk progress for %s: %v", chunkID, err)
+					}
 				}
 			}
 
@@ -753,13 +682,7 @@ func deleteUploadHandler(w http.ResponseWriter, r *http.Request) {
 
 // jobsHandler returns all active jobs
 func jobsHandler(w http.ResponseWriter, r *http.Request) {
-	jobsMutex.RLock()
-	defer jobsMutex.RUnlock()
-
-	jobs := make([]*EncodeJob, 0, len(activeJobs))
-	for _, job := range activeJobs {
-		jobs = append(jobs, job)
-	}
+	jobs := jobManager.GetAllJobs()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(jobs)
@@ -776,21 +699,12 @@ func deleteJobHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobsMutex.Lock()
-	job, exists := activeJobs[request.JobID]
-	if !exists {
-		jobsMutex.Unlock()
+	if err := jobManager.DeleteJob(request.JobID); err != nil {
 		respondWithError(w, http.StatusNotFound, "Job not found")
 		return
 	}
 
-	// Remove job from active jobs
-	delete(activeJobs, request.JobID)
-	jobsMutex.Unlock()
-
-	log.Printf("Deleted job: %s (status was: %s)", request.JobID, job.Status)
-
-	// TODO: If job is processing, send cancel message to worker
+	log.Printf("Deleted job: %s", request.JobID)
 
 	response := UploadResponse{
 		Success: true,
@@ -799,27 +713,6 @@ func deleteJobHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
-}
-
-// updateJobProgress updates job progress
-func updateJobProgress(jobID, status string, progress int, errorMsg string) {
-	jobsMutex.Lock()
-	defer jobsMutex.Unlock()
-
-	job, exists := activeJobs[jobID]
-	if !exists {
-		log.Printf("Job %s not found", jobID)
-		return
-	}
-
-	job.Status = status
-	job.Progress = progress
-
-	if errorMsg != "" {
-		log.Printf("Job %s encountered an error: %s", jobID, errorMsg)
-	}
-
-	log.Printf("Updated job %s progress: %d%%", jobID, progress)
 }
 
 // listTranscodedHandler lists transcoded files

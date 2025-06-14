@@ -8,6 +8,7 @@
 # Compiled binaries
 htranscode
 worker
+api
 
 # Test binary, built with `go test -c`
 *.test
@@ -66,3 +67,8 @@ transcoded/
 *.webm
 *.m4v
 *.3gp
+
+# Test directories
+test_chunks/
+test_cache/
+test_output/
