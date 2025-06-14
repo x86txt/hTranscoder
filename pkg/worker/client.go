@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -290,34 +291,60 @@ func (c *Client) processJobs() {
 		// Update status to processing
 		c.sendJobStatus(job, models.ChunkStatusProcessing, 0, "")
 
-		// Construct paths
-		inputPath := job.InputPath
-		if inputPath == "" {
-			log.Printf("Job %s has no input path", job.ID)
-			c.sendJobStatus(job, models.ChunkStatusFailed, 0, "No input path specified")
-			continue
+		var inputPath string
+		var outputPath string
+
+		if job.IsRemoteWorker {
+			// Virtual chunk: extract segment from original video
+			log.Printf("Processing virtual chunk %d (%.2fs-%.2fs) from %s",
+				job.ChunkIndex, job.SegmentStart, job.SegmentStart+job.SegmentDuration, job.InputPath)
+
+			// Check if original video exists (might be a shared path or URL)
+			if _, err := os.Stat(job.InputPath); os.IsNotExist(err) {
+				log.Printf("Original video file does not exist: %s", job.InputPath)
+				c.sendJobStatus(job, models.ChunkStatusFailed, 0, "Original video file not found")
+				continue
+			}
+
+			// Create local temp directory for this chunk
+			tempDir := filepath.Join(c.outputDir, "temp", job.JobID)
+			if err := os.MkdirAll(tempDir, 0755); err != nil {
+				log.Printf("Failed to create temp directory: %v", err)
+				c.sendJobStatus(job, models.ChunkStatusFailed, 0, "Failed to create temp directory")
+				continue
+			}
+
+			// Extract the segment using FFmpeg
+			segmentFile := filepath.Join(tempDir, fmt.Sprintf("segment_%03d.mp4", job.ChunkIndex))
+			if err := c.extractSegment(job.InputPath, segmentFile, job.SegmentStart, job.SegmentDuration); err != nil {
+				log.Printf("Failed to extract segment: %v", err)
+				c.sendJobStatus(job, models.ChunkStatusFailed, 0, fmt.Sprintf("Failed to extract segment: %v", err))
+				continue
+			}
+
+			inputPath = segmentFile
+			outputPath = filepath.Join(c.outputDir, job.OutputPath)
+		} else {
+			// Physical chunk: use provided chunk file
+			log.Printf("Processing physical chunk from %s", job.InputPath)
+
+			// Check if input file exists
+			if _, err := os.Stat(job.InputPath); os.IsNotExist(err) {
+				log.Printf("Input file does not exist: %s", job.InputPath)
+				c.sendJobStatus(job, models.ChunkStatusFailed, 0, "Input file not found")
+				continue
+			}
+
+			inputPath = job.InputPath
+			outputPath = job.OutputPath
 		}
 
-		// Check if input file exists
-		if _, err := os.Stat(inputPath); os.IsNotExist(err) {
-			log.Printf("Input file does not exist: %s", inputPath)
-			c.sendJobStatus(job, models.ChunkStatusFailed, 0, "Input file not found")
+		// Ensure output directory exists
+		if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+			log.Printf("Failed to create output directory: %v", err)
+			c.sendJobStatus(job, models.ChunkStatusFailed, 0, "Failed to create output directory")
 			continue
 		}
-
-		// Generate output filename
-		baseFilename := filepath.Base(inputPath)
-		ext := filepath.Ext(baseFilename)
-		nameWithoutExt := baseFilename[:len(baseFilename)-len(ext)]
-
-		// Add transcoding parameters to filename
-		outputFilename := fmt.Sprintf("%s_transcoded_%s_%s%s",
-			nameWithoutExt,
-			getCodecFromJob(job),
-			getBitrateFromJob(job),
-			".mp4") // Always output as MP4
-
-		outputPath := filepath.Join(c.outputDir, outputFilename)
 
 		// Prepare encoding options
 		opts := transcoder.EncodeOptions{
@@ -355,9 +382,42 @@ func (c *Client) processJobs() {
 			log.Printf("Transcoding completed: %s (%.2f MB)", outputPath, float64(stat.Size())/(1024*1024))
 		}
 
+		// Clean up temporary segment file for virtual chunks
+		if job.IsRemoteWorker && inputPath != job.InputPath {
+			if err := os.Remove(inputPath); err != nil {
+				log.Printf("Warning: failed to clean up temp file %s: %v", inputPath, err)
+			}
+		}
+
 		// Mark as completed
 		c.sendJobStatus(job, models.ChunkStatusCompleted, 100, outputPath)
 	}
+}
+
+// extractSegment extracts a time segment from a video using FFmpeg
+func (c *Client) extractSegment(inputPath, outputPath string, startTime, duration float64) error {
+	// Use FFmpeg to extract the segment
+	// -ss: start time, -t: duration, -c copy: avoid re-encoding during extraction
+	args := []string{
+		"-i", inputPath,
+		"-ss", fmt.Sprintf("%.2f", startTime),
+		"-t", fmt.Sprintf("%.2f", duration),
+		"-c", "copy", // Copy streams to avoid quality loss during segmentation
+		"-avoid_negative_ts", "make_zero",
+		"-y", // Overwrite output file
+		outputPath,
+	}
+
+	cmd := exec.Command("ffmpeg", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg segment extraction failed: %w\nOutput: %s", err, string(output))
+	}
+
+	log.Printf("Extracted segment: %.2fs-%.2fs from %s to %s",
+		startTime, startTime+duration, filepath.Base(inputPath), filepath.Base(outputPath))
+
+	return nil
 }
 
 // Helper functions to extract encoding parameters from job

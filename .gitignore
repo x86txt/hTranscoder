@@ -72,3 +72,10 @@ transcoded/
 test_chunks/
 test_cache/
 test_output/
+
+# Installation test directories (when testing install.sh locally)
+install_test/
+
+# final builds
+build/
+dist/

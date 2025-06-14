@@ -51,18 +51,48 @@ The chunking system automatically splits video files into smaller segments that 
 
 ## Implementation Details
 
-### Video Splitting
+### Video Chunking Approaches
 
-Videos are split using FFmpeg with the following approach:
+The system uses two different chunking strategies depending on worker location:
 
-- **Equal Time Segments**: Each chunk has approximately the same duration
-- **Stream Copy**: Initial split uses `-c copy` to avoid re-encoding
-- **Precise Timing**: Uses `-ss` for start time and `-t` for duration
-- **Timestamp Handling**: Uses `-avoid_negative_ts make_zero` for compatibility
+#### 1. **Physical Chunking (Local Workers)**
+For workers running on the same machine as the master:
+
+- **Pre-splitting**: Master physically splits video into files using FFmpeg
+- **Direct File Access**: Workers process pre-created chunk files  
+- **Efficient**: Avoids duplicate processing of the same video segments
+- **File Paths**: Workers receive paths to physical chunk files
 
 Example command:
 ```bash
 ffmpeg -i input.mp4 -ss 0.00 -t 20.00 -c copy -avoid_negative_ts make_zero chunk_000.mp4
+```
+
+#### 2. **Virtual Chunking (Remote Workers)**
+For workers running on different machines:
+
+- **Timing-Based**: Master calculates time segments and sends timing info
+- **On-Demand Extraction**: Workers extract their assigned segment from original video
+- **Network-Friendly**: Avoids transferring large chunk files over network
+- **Time Segments**: Workers receive start time + duration parameters
+
+Example worker process:
+```bash
+# Worker receives: start=60.0s, duration=30.0s
+ffmpeg -i original.mp4 -ss 60.00 -t 30.00 -c copy segment.mp4
+# Then encodes: ffmpeg -i segment.mp4 [encoding options] output.mp4
+```
+
+### Worker Detection
+
+The system automatically categorizes workers:
+
+```go
+// Local workers (same machine as master)
+isLocal := worker.IPAddress == "127.0.0.1" || worker.IPAddress == "::1" || worker.IPAddress == "localhost"
+
+// Remote workers (different machines)  
+isRemote := !isLocal
 ```
 
 ### Chunk Distribution
@@ -208,20 +238,43 @@ Enable detailed logging by checking:
 
 ## Future Enhancements
 
-### Planned Features
+### **High Priority (Remote Worker Support)**
 
-- [ ] **Smart Chunk Sizing**: Adjust chunk size based on video content
-- [ ] **Retry Logic**: Automatic retry for failed chunks
-- [ ] **Chunk Prioritization**: Process important chunks first
+- [ ] **Automatic File Transfer**: Upload completed chunks back to master
+  ```go
+  // Workers upload via HTTP POST or WebSocket binary transfer
+  POST /api/chunks/upload
+  Content-Type: multipart/form-data
+  ```
+
+- [ ] **Shared Storage Detection**: Auto-detect NFS/SMB mounted storage
+  ```bash
+  # Auto-detect shared paths
+  /shared, /mnt, /network -> shared storage
+  /home, /tmp, /var -> local storage  
+  ```
+
+- [ ] **HTTP Video Streaming**: Stream video segments to workers
+  ```http
+  GET /api/video/stream?file=video.mp4&start=60&duration=30
+  Range: bytes=1048576-2097152
+  ```
+
+### **Medium Priority (Optimization)**
+
+- [ ] **Smart Chunk Sizing**: Adjust chunk size based on video content and network
+- [ ] **Retry Logic**: Automatic retry for failed chunks with exponential backoff
+- [ ] **Chunk Prioritization**: Process important chunks first (beginning/end)
 - [ ] **Progressive Delivery**: Stream chunks as they complete
 - [ ] **Quality Validation**: Verify chunk quality before merging
 
-### Advanced Options
+### **Low Priority (Advanced Features)**
 
-- [ ] **Custom Chunk Boundaries**: Split at scene changes
+- [ ] **Custom Chunk Boundaries**: Split at scene changes using ML
 - [ ] **Parallel Encoding Passes**: Multi-pass encoding with chunking
 - [ ] **Adaptive Bitrate**: Different quality for different chunks
 - [ ] **GPU Load Balancing**: Distribute based on GPU capabilities
+- [ ] **Cloud Integration**: Auto-scale workers in cloud environments
 
 ## API Reference
 
@@ -261,4 +314,59 @@ func (vc *VideoChunker) MergeChunks(chunks []string, outputPath string) error
 
 The chunking system provides significant performance improvements for video transcoding by enabling parallel processing across multiple workers. It's designed to be automatic and transparent to users while providing the flexibility needed for various deployment scenarios.
 
-For questions or issues, check the logs and refer to the troubleshooting section above. 
+For questions or issues, check the logs and refer to the troubleshooting section above.
+
+## Current Limitations & Requirements
+
+### File Access Requirements
+
+#### **For Local Workers:**
+- ✅ **Ready to Use**: Works out of the box
+- ✅ **Shared File System**: Master and workers share the same file system
+- ✅ **Efficient Processing**: Pre-split chunks avoid duplicate processing
+
+#### **For Remote Workers:**
+- ⚠️ **Original Video Access**: Remote workers must have access to the original video file
+- ⚠️ **File Transfer Gap**: Completed chunks must be accessible to master for merging
+- ⚠️ **Network Bandwidth**: Workers download/access full original video
+
+### Current Workarounds
+
+**Option 1: Shared Network Storage**
+```bash
+# Mount shared storage on all machines
+sudo mount -t nfs master:/shared /shared
+# Place videos in shared location
+cp video.mp4 /shared/videos/
+# Workers can access /shared/videos/video.mp4
+```
+
+**Option 2: Local File Replication**
+```bash
+# Copy video to all worker machines
+scp video.mp4 worker1:/path/to/video.mp4
+scp video.mp4 worker2:/path/to/video.mp4
+# Update paths in job submission
+```
+
+**Option 3: HTTP/HTTPS Access**
+```bash
+# Serve videos via HTTP from master
+python3 -m http.server 8000 --directory /videos
+# Workers access: http://master:8000/video.mp4
+```
+
+### Known Issues
+
+1. **Remote Chunk Collection**: 
+   - Remote workers produce chunks locally
+   - Master cannot access remote chunks for merging
+   - **Workaround**: Use shared storage or implement file transfer
+
+2. **Network Efficiency**:
+   - Each remote worker downloads full original video
+   - **Future**: Implement chunk streaming or delta transfer
+
+3. **Path Resolution**:
+   - Original video paths must be valid on worker machines
+   - **Workaround**: Use absolute paths or shared mount points 

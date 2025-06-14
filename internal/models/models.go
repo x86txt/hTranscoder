@@ -53,8 +53,8 @@ type ChunkJob struct {
 	ID         string          `json:"id"`
 	JobID      string          `json:"jobId"`
 	ChunkIndex int             `json:"chunkIndex"`
-	InputPath  string          `json:"inputPath"`
-	OutputPath string          `json:"outputPath"`
+	InputPath  string          `json:"inputPath"`  // Original video path (for remote workers)
+	OutputPath string          `json:"outputPath"` // Where to save encoded result
 	WorkerID   string          `json:"workerId"`
 	Status     string          `json:"status"`
 	Progress   int             `json:"progress"`
@@ -62,6 +62,11 @@ type ChunkJob struct {
 	EndTime    time.Time       `json:"endTime"`
 	RetryCount int             `json:"retryCount"`
 	Settings   *EncodeSettings `json:"settings"`
+	// Virtual chunking information for remote workers
+	SegmentStart    float64 `json:"segmentStart"`    // Start time in seconds
+	SegmentDuration float64 `json:"segmentDuration"` // Duration in seconds
+	TotalDuration   float64 `json:"totalDuration"`   // Total video duration
+	IsRemoteWorker  bool    `json:"isRemoteWorker"`  // Whether this is for a remote worker
 }
 
 // WorkerMessage represents messages between master and workers
