@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -25,6 +26,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+//go:embed templates/*
+var templateFS embed.FS
+
 var (
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
@@ -37,6 +41,8 @@ var (
 	secretKey     string
 	appConfig     *config.Config
 )
+
+const Version = "0.1.0-alpha"
 
 type VideoFile struct {
 	Name       string `json:"name"`
@@ -55,16 +61,44 @@ type UploadResponse struct {
 
 func main() {
 	var (
-		configFile = flag.String("config", "htranscode.conf", "Configuration file path")
-		keyFile    = flag.String("key", ".htranscode.key", "Secret key file path")
+		configFile  = flag.String("config", "htranscode.conf", "Path to the configuration file (JSON or TOML). Example: --config=/etc/htranscode.conf")
+		keyFile     = flag.String("key", ".htranscode.key", "Path to the secret key file for worker authentication. Example: --key=/etc/htranscode.key")
+		helpFlag    = flag.Bool("help", false, "Show this help message and exit.")
+		versionFlag = flag.Bool("version", false, "Show version information and exit.")
 	)
 	flag.Parse()
+
+	if *helpFlag {
+		fmt.Printf("hTranscode API Server (version %s)\n", Version)
+		fmt.Println("\nDistributed video transcoding API/master server. Handles job management, worker coordination, uploads, and chunk distribution.")
+		fmt.Println("\nUsage:")
+		fmt.Println("  htranscode-api --config=PATH --key=PATH")
+		fmt.Println("\nFlags:")
+		fmt.Println("  --config     Path to the configuration file (default: htranscode.conf)")
+		fmt.Println("  --key        Path to the secret key file for worker authentication (default: .htranscode.key)")
+		fmt.Println("  --help       Show this help message and exit")
+		fmt.Println("  --version    Show version information and exit")
+		fmt.Println("\nExample:")
+		fmt.Println("  ./htranscode-api --config=prod.conf --key=prod.key")
+		os.Exit(0)
+	}
+	if *versionFlag {
+		fmt.Printf("hTranscode API Server version %s\n", Version)
+		os.Exit(0)
+	}
 
 	// Load configuration
 	var err error
 	appConfig, err = config.LoadConfig(*configFile)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Clear the upload cache directory on startup
+	if err := os.RemoveAll(appConfig.Storage.TempCacheDir); err != nil {
+		log.Printf("Warning: Failed to clear upload cache directory %s: %v", appConfig.Storage.TempCacheDir, err)
+	} else {
+		log.Printf("Cleared upload cache directory: %s", appConfig.Storage.TempCacheDir)
 	}
 
 	// Validate configuration
@@ -86,11 +120,19 @@ func main() {
 		}
 	}
 
-	// Initialize worker manager
+	// Initialize managers
 	workerManager = manager.NewWorkerManager()
 
-	// Initialize job manager
-	jobManager = manager.NewJobManager(workerManager, appConfig.Storage.TempCacheDir, "./transcoded")
+	// Get master URL for workers to connect back
+	masterURL := appConfig.GetServerURL()
+
+	// Ensure cache directory exists
+	if err := os.MkdirAll(appConfig.Storage.TempCacheDir, 0755); err != nil {
+		log.Fatalf("Failed to create cache directory: %v", err)
+	}
+
+	// Initialize job manager with the master URL
+	jobManager = manager.NewJobManager(workerManager, appConfig.Storage.TempCacheDir, "./transcoded", masterURL)
 
 	// Load or generate secret key
 	secretKey, err = loadOrGenerateKey(*keyFile)
@@ -111,7 +153,7 @@ func main() {
 
 	// Start worker health checker
 	go func() {
-		ticker := time.NewTicker(1 * time.Second) // Check health every second
+		ticker := time.NewTicker(3 * time.Second) // Check health every 3 seconds
 		defer ticker.Stop()
 		for range ticker.C {
 			workerManager.CheckWorkerHealth()
@@ -130,17 +172,28 @@ func main() {
 	// Routes
 	r.HandleFunc("/", homeHandler).Methods("GET")
 	r.HandleFunc("/simple", simpleHandler).Methods("GET")
-	r.HandleFunc("/api/browse", browseHandler).Methods("POST")
-	r.HandleFunc("/api/upload", uploadHandler).Methods("POST")
-	r.HandleFunc("/api/uploads", listUploadsHandler).Methods("GET")
-	r.HandleFunc("/api/uploads/delete", deleteUploadHandler).Methods("DELETE")
-	r.HandleFunc("/api/encode", encodeHandler).Methods("POST")
-	r.HandleFunc("/api/jobs", jobsHandler).Methods("GET")
-	r.HandleFunc("/api/jobs/delete", deleteJobHandler).Methods("DELETE")
-	r.HandleFunc("/api/workers", workersHandler).Methods("GET")
-	r.HandleFunc("/api/config", configHandler).Methods("GET")
+	r.HandleFunc("/favicon.ico", faviconHandler).Methods("GET")
+	r.PathPrefix("/styles/").HandlerFunc(stylesHandler).Methods("GET")
+
+	// API routes
+	apiRouter := r.PathPrefix("/api").Subrouter()
+	apiRouter.HandleFunc("/browse", browseHandler).Methods("GET")
+	apiRouter.HandleFunc("/encode", encodeHandler).Methods("POST")
+	apiRouter.HandleFunc("/workers", workersHandler).Methods("GET")
+	apiRouter.HandleFunc("/upload", uploadHandler).Methods("POST")
+	apiRouter.HandleFunc("/uploads", listUploadsHandler).Methods("GET")
+	apiRouter.HandleFunc("/config", configHandler).Methods("GET")
+	apiRouter.HandleFunc("/uploads/delete", deleteUploadHandler).Methods("POST")
+	apiRouter.HandleFunc("/jobs", jobsHandler).Methods("GET")
+	apiRouter.HandleFunc("/jobs/delete", deleteJobHandler).Methods("POST")
+	apiRouter.HandleFunc("/transcoded", listTranscodedHandler).Methods("GET")
+
+	// Chunk transfer endpoints
+	apiRouter.HandleFunc("/chunks/{jobId}/{chunkId}/download", chunkDownloadHandler).Methods("GET")
+	apiRouter.HandleFunc("/chunks/{jobId}/{chunkId}/upload", chunkUploadHandler).Methods("POST")
+
+	// WebSocket endpoint
 	r.HandleFunc("/ws", websocketHandler)
-	r.HandleFunc("/api/transcoded", listTranscodedHandler).Methods("GET")
 
 	addr := fmt.Sprintf(":%d", appConfig.Server.Port)
 	serverURL := appConfig.GetServerURL()
@@ -152,6 +205,7 @@ func main() {
 		fmt.Printf("🔑 Copy the secret key file to workers: %s\n", *keyFile)
 	}
 	fmt.Printf("🔍 Workers can auto-discover this server using the secret key\n")
+	fmt.Printf("hTranscode API Server version %s\n", Version)
 
 	// Enhanced server configuration
 	server := &http.Server{
@@ -210,13 +264,88 @@ func loadOrGenerateKey(keyFile string) (string, error) {
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
-	tmpl := template.Must(template.ParseFiles("./cmd/templates/index.html"))
+	tmpl, err := template.ParseFS(templateFS, "templates/index.html")
+	if err != nil {
+		http.Error(w, "Template not found", http.StatusInternalServerError)
+		log.Printf("Failed to parse template: %v", err)
+		return
+	}
 	tmpl.Execute(w, nil)
 }
 
 func simpleHandler(w http.ResponseWriter, r *http.Request) {
-	tmpl := template.Must(template.ParseFiles("./cmd/templates/index-simple.html"))
+	tmpl, err := template.ParseFS(templateFS, "templates/index-simple.html")
+	if err != nil {
+		http.Error(w, "Template not found", http.StatusInternalServerError)
+		log.Printf("Failed to parse template: %v", err)
+		return
+	}
 	tmpl.Execute(w, nil)
+}
+
+// stylesHandler serves embedded CSS files
+func stylesHandler(w http.ResponseWriter, r *http.Request) {
+	// Get the requested file path
+	filePath := strings.TrimPrefix(r.URL.Path, "/styles/")
+	if filePath == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Handle special cases and missing extensions
+	var embeddedPath string
+	switch filePath {
+	case "tailwindcss":
+		// Map tailwindcss to compiled styles.css (which contains processed Tailwind CSS)
+		embeddedPath = "templates/styles/styles.css"
+	case "styles.css":
+		// Map styles.css to compiled styles.css
+		embeddedPath = "templates/styles/styles.css"
+	case "index.css":
+		// Map index.css to compiled styles.css for compatibility
+		embeddedPath = "templates/styles/styles.css"
+	default:
+		// If no extension, assume it's CSS and map to compiled styles
+		if !strings.Contains(filePath, ".") {
+			embeddedPath = "templates/styles/styles.css"
+		} else {
+			embeddedPath = "templates/styles/" + filePath
+		}
+	}
+
+	// Read the file from embedded filesystem
+	content, err := templateFS.ReadFile(embeddedPath)
+	if err != nil {
+		log.Printf("Failed to read embedded CSS file %s: %v", embeddedPath, err)
+		http.NotFound(w, r)
+		return
+	}
+
+	// Always set CSS content type for styles
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+
+	w.Write(content)
+}
+
+// faviconHandler serves a simple favicon to prevent 404 errors
+func faviconHandler(w http.ResponseWriter, r *http.Request) {
+	// Return a simple 1x1 transparent PNG as favicon
+	// This prevents the 404 error in browser console
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=86400") // Cache for 1 day
+
+	// 1x1 transparent PNG (67 bytes)
+	favicon := []byte{
+		0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+		0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+		0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+		0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+		0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+	}
+
+	w.Write(favicon)
 }
 
 func browseHandler(w http.ResponseWriter, r *http.Request) {
@@ -361,6 +490,12 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Record the time of message receipt for latency calculation,
+		// but only if a worker has been associated with this connection.
+		if workerConn != nil {
+			workerManager.RecordMessageTime(workerConn.ID)
+		}
+
 		// Skip logging heartbeat messages to reduce log spam
 		if msg.Type != "heartbeat" {
 			log.Printf("Received message type: %s", msg.Type)
@@ -416,35 +551,29 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 				// Parse heartbeat data
 				heartbeatData, ok := msg.Payload.(map[string]interface{})
 				if ok {
-					if id, ok := heartbeatData["id"].(string); ok {
-						currentJobs := 0
-						if jobs, ok := heartbeatData["currentJobs"].(float64); ok {
-							currentJobs = int(jobs)
-						}
-
-						// Extract ping time for latency calculation
-						var pingTime int64 = 0
-						if pt, ok := heartbeatData["pingTime"].(float64); ok {
-							pingTime = int64(pt)
-						}
-
-						// Extract usage statistics
-						var gpuUsage, gpuMemory, cpuUsage, networkSpeed float64
-						if gpu, ok := heartbeatData["gpuUsage"].(float64); ok {
-							gpuUsage = gpu
-						}
-						if gpuMem, ok := heartbeatData["gpuMemory"].(float64); ok {
-							gpuMemory = gpuMem
-						}
-						if cpu, ok := heartbeatData["cpuUsage"].(float64); ok {
-							cpuUsage = cpu
-						}
-						if net, ok := heartbeatData["networkSpeed"].(float64); ok {
-							networkSpeed = net
-						}
-
-						workerManager.UpdateWorkerHeartbeatWithUsage(id, currentJobs, pingTime, gpuUsage, gpuMemory, cpuUsage, networkSpeed)
+					// The worker's ID is implicit from the connection
+					currentJobs := 0
+					if jobs, ok := heartbeatData["currentJobs"].(float64); ok {
+						currentJobs = int(jobs)
 					}
+
+					// Extract usage statistics
+					var gpuUsage, gpuMemory, cpuUsage, networkSpeed float64
+					if gpu, ok := heartbeatData["gpuUsage"].(float64); ok {
+						gpuUsage = gpu
+					}
+					if gpuMem, ok := heartbeatData["gpuMemory"].(float64); ok {
+						gpuMemory = gpuMem
+					}
+					if cpu, ok := heartbeatData["cpuUsage"].(float64); ok {
+						cpuUsage = cpu
+					}
+					if net, ok := heartbeatData["networkSpeed"].(float64); ok {
+						networkSpeed = net
+					}
+
+					// Update worker status using the simplified heartbeat data
+					workerManager.UpdateWorkerHeartbeatWithUsage(workerConn.ID, currentJobs, gpuUsage, gpuMemory, cpuUsage, networkSpeed)
 				}
 			}
 
@@ -780,4 +909,142 @@ func addProtocolHeaders(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// chunkDownloadHandler serves chunk files to workers
+func chunkDownloadHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	jobID := vars["jobId"]
+	chunkID := vars["chunkId"]
+
+	// Security check - validate job and chunk IDs
+	if jobID == "" || chunkID == "" {
+		http.Error(w, "Invalid job or chunk ID", http.StatusBadRequest)
+		return
+	}
+
+	// Extract chunk index from chunkID (format: job_XXXXX_000)
+	parts := strings.Split(chunkID, "_")
+	var chunkIndex string
+	if len(parts) >= 3 {
+		chunkIndex = parts[len(parts)-1]
+	} else {
+		http.Error(w, "Invalid chunk ID format", http.StatusBadRequest)
+		return
+	}
+
+	// Construct chunk file path - matches the pattern created by chunker
+	chunkPath := filepath.Join(appConfig.Storage.TempCacheDir, jobID, fmt.Sprintf("%s_chunk_%s.mp4", jobID, chunkIndex))
+
+	// Check if file exists
+	if _, err := os.Stat(chunkPath); os.IsNotExist(err) {
+		http.Error(w, "Chunk file not found", http.StatusNotFound)
+		return
+	}
+
+	// Open the file
+	file, err := os.Open(chunkPath)
+	if err != nil {
+		http.Error(w, "Failed to open chunk file", http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+
+	// Get file info for size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		http.Error(w, "Failed to get file info", http.StatusInternalServerError)
+		return
+	}
+
+	// Set headers
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(chunkPath)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+
+	// Stream the file
+	log.Printf("Serving chunk file: %s to worker", chunkPath)
+	http.ServeContent(w, r, filepath.Base(chunkPath), fileInfo.ModTime(), file)
+}
+
+// chunkUploadHandler receives processed chunks from workers
+func chunkUploadHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	jobID := vars["jobId"]
+	chunkID := vars["chunkId"]
+
+	// Security check - validate job and chunk IDs
+	if jobID == "" || chunkID == "" {
+		respondWithError(w, http.StatusBadRequest, "Invalid job or chunk ID")
+		return
+	}
+
+	// Limit upload size to prevent abuse
+	maxSize := appConfig.Storage.MaxUploadSizeMB * 1024 * 1024
+	r.Body = http.MaxBytesReader(w, r.Body, maxSize)
+
+	// Parse multipart form
+	if err := r.ParseMultipartForm(maxSize); err != nil {
+		respondWithError(w, http.StatusBadRequest, "File too large or invalid form data")
+		return
+	}
+
+	file, _, err := r.FormFile("chunkFile")
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "No chunk file provided")
+		return
+	}
+	defer file.Close()
+
+	// Create chunk directory if it doesn't exist
+	chunkDir := filepath.Join(appConfig.Storage.TempCacheDir, jobID)
+	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to create chunk directory")
+		return
+	}
+
+	// Determine chunk file path based on the chunk index
+	// Extract chunk index from chunkID (format: job_XXXXX_000)
+	parts := strings.Split(chunkID, "_")
+	var chunkIndex string
+	if len(parts) >= 3 {
+		chunkIndex = parts[len(parts)-1]
+	} else {
+		chunkIndex = chunkID
+	}
+
+	destPath := filepath.Join(chunkDir, fmt.Sprintf("%s_encoded_chunk_%s.mp4", jobID, chunkIndex))
+
+	// Create destination file
+	destFile, err := os.Create(destPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to create chunk file")
+		return
+	}
+	defer destFile.Close()
+
+	// Copy uploaded chunk to destination
+	writtenBytes, err := io.Copy(destFile, file)
+	if err != nil {
+		os.Remove(destPath) // Clean up on error
+		respondWithError(w, http.StatusInternalServerError, "Failed to save chunk file")
+		return
+	}
+
+	log.Printf("Received processed chunk: %s for job %s (size: %d bytes)", chunkID, jobID, writtenBytes)
+
+	// Update chunk status to indicate file is available
+	// The worker should have already sent the completion status via WebSocket
+
+	response := map[string]interface{}{
+		"success":  true,
+		"message":  "Chunk uploaded successfully",
+		"chunkId":  chunkID,
+		"jobId":    jobID,
+		"size":     writtenBytes,
+		"filePath": destPath,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }

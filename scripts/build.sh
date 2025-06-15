@@ -205,3 +205,5 @@ fi
 
 echo -e "${GREEN}All builds completed successfully!${NC}"
 echo -e "Binaries are available in: ${BUILD_DIR}/"
+echo -e "Binaries are web downloadable at http://plex.ip.lan"
+

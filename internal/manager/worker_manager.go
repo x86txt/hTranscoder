@@ -2,6 +2,7 @@ package manager
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -19,9 +20,10 @@ type WorkerManager struct {
 
 // WorkerConnection represents a connected worker
 type WorkerConnection struct {
-	Worker   *models.Worker
-	Conn     *websocket.Conn
-	LastPing time.Time
+	Worker          *models.Worker
+	Conn            *websocket.Conn
+	LastPing        time.Time
+	lastMessageTime time.Time // Server time when the last message was received
 }
 
 // NewWorkerManager creates a new worker manager
@@ -55,9 +57,17 @@ func (wm *WorkerManager) RegisterWorker(worker *models.Worker, conn *websocket.C
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 
-	// Check if worker already exists
+	// Check if worker ID is unique
 	if _, exists := wm.workers[worker.ID]; exists {
-		return fmt.Errorf("worker %s already registered", worker.ID)
+		return fmt.Errorf("worker ID %s already registered", worker.ID)
+	}
+
+	log.Printf("Registering worker: %s (%s)", worker.Name, worker.ID)
+	wm.workers[worker.ID] = &WorkerConnection{
+		Worker:          worker,
+		Conn:            conn,
+		LastPing:        time.Now(),
+		lastMessageTime: time.Now(), // Initialize with current time
 	}
 
 	// Set IP address if not provided by worker
@@ -67,13 +77,6 @@ func (wm *WorkerManager) RegisterWorker(worker *models.Worker, conn *websocket.C
 
 	// Initialize latency to 0
 	worker.Latency = 0
-
-	// Add worker
-	wm.workers[worker.ID] = &WorkerConnection{
-		Worker:   worker,
-		Conn:     conn,
-		LastPing: time.Now(),
-	}
 
 	fmt.Printf("Worker registered: %s (%s) from %s\n", worker.Name, worker.ID, worker.IPAddress)
 	return nil
@@ -175,43 +178,37 @@ func (wm *WorkerManager) UpdateWorkerHeartbeat(workerID string, currentJobs int,
 	return fmt.Errorf("worker %s not found", workerID)
 }
 
-// UpdateWorkerHeartbeatWithUsage updates heartbeat with real-time usage statistics
-func (wm *WorkerManager) UpdateWorkerHeartbeatWithUsage(workerID string, currentJobs int, pingTime int64, gpuUsage, gpuMemory, cpuUsage, networkSpeed float64) error {
+// UpdateWorkerHeartbeatWithUsage updates a worker's status based on a heartbeat message,
+// including real-time usage statistics and latency calculation.
+func (wm *WorkerManager) UpdateWorkerHeartbeatWithUsage(id string, currentJobs int, gpuUsage, gpuMemory, cpuUsage, networkSpeed float64) {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 
-	if wc, exists := wm.workers[workerID]; exists {
+	if conn, exists := wm.workers[id]; exists {
 		now := time.Now()
-		wc.Worker.LastPing = now
-		wc.Worker.CurrentJobs = currentJobs
-		wc.LastPing = now
 
-		// Update usage statistics
-		wc.Worker.GPUUsage = gpuUsage
-		wc.Worker.GPUMemory = gpuMemory
-		wc.Worker.CPUUsage = cpuUsage
-		wc.Worker.NetworkSpeed = networkSpeed
+		// Update worker state - update BOTH LastPing fields
+		conn.Worker.CurrentJobs = currentJobs
+		conn.Worker.LastPing = now // Use server time for the heartbeat
+		conn.LastPing = now        // Also update connection LastPing for health check
+		conn.Worker.Status = models.WorkerStatusOnline
 
-		// Calculate latency if pingTime is provided
-		if pingTime > 0 {
-			pingTimeMs := time.UnixMilli(pingTime)
-			latency := now.Sub(pingTimeMs)
-			// Store latency in microseconds for precision
-			wc.Worker.Latency = int(latency.Microseconds())
-		}
+		// Update usage stats
+		conn.Worker.GPUUsage = gpuUsage
+		conn.Worker.GPUMemory = gpuMemory
+		conn.Worker.CPUUsage = cpuUsage
+		conn.Worker.NetworkSpeed = networkSpeed
 
-		// Update status based on job count
-		if currentJobs >= wc.Worker.MaxJobs {
-			wc.Worker.Status = models.WorkerStatusBusy
-		} else if currentJobs > 0 {
-			wc.Worker.Status = models.WorkerStatusOnline
+		// Calculate latency based on the last message time, not client-provided time
+		conn.Worker.Latency = int(time.Since(conn.lastMessageTime).Milliseconds())
+
+		// Determine if the worker is busy or idle
+		if conn.Worker.CurrentJobs >= conn.Worker.MaxJobs {
+			conn.Worker.Status = models.WorkerStatusBusy
 		} else {
-			wc.Worker.Status = models.WorkerStatusIdle
+			conn.Worker.Status = models.WorkerStatusIdle
 		}
-
-		return nil
 	}
-	return fmt.Errorf("worker %s not found", workerID)
 }
 
 // CheckWorkerHealth marks workers as offline if they haven't pinged recently
@@ -219,13 +216,12 @@ func (wm *WorkerManager) CheckWorkerHealth() {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 
-	timeout := 2 * time.Second // Workers heartbeat every 250ms, so 2s is plenty
 	now := time.Now()
-
-	for id, wc := range wm.workers {
-		if now.Sub(wc.LastPing) > timeout {
-			wc.Worker.Status = models.WorkerStatusOffline
-			fmt.Printf("Worker %s marked as offline (no heartbeat)\n", id)
+	for id, worker := range wm.workers {
+		// Increase timeout window from 10 to 20 seconds
+		if now.Sub(worker.lastMessageTime) > 20*time.Second {
+			worker.Worker.Status = "offline"
+			log.Printf("Worker %s marked as offline", id)
 		}
 	}
 }
@@ -257,4 +253,29 @@ func (wm *WorkerManager) SendToWorker(workerID string, message *models.WorkerMes
 		return wc.Conn.WriteJSON(message)
 	}
 	return fmt.Errorf("worker %s not found", workerID)
+}
+
+func (wm *WorkerManager) checkOfflineWorkers() {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+
+	timeout := 10 * time.Second // Increased from 5s to allow for network delays
+	for id, conn := range wm.workers {
+		if time.Since(conn.LastPing) > timeout {
+			if conn.Worker.Status != models.WorkerStatusOffline {
+				log.Printf("Worker %s marked as offline (no heartbeat)", id)
+				conn.Worker.Status = models.WorkerStatusOffline
+			}
+		}
+	}
+}
+
+// RecordMessageTime updates the last message timestamp for a given worker.
+// This is used for server-side latency calculations.
+func (wm *WorkerManager) RecordMessageTime(workerID string) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	if conn, exists := wm.workers[workerID]; exists {
+		conn.lastMessageTime = time.Now()
+	}
 }

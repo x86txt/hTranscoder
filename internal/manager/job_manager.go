@@ -23,10 +23,11 @@ type JobManager struct {
 	mu            sync.RWMutex
 	tempDir       string
 	outputDir     string
+	masterURL     string // URL of the master server for chunk transfers
 }
 
 // NewJobManager creates a new job manager
-func NewJobManager(workerManager *WorkerManager, tempDir, outputDir string) *JobManager {
+func NewJobManager(workerManager *WorkerManager, tempDir, outputDir, masterURL string) *JobManager {
 	return &JobManager{
 		jobs:          make(map[string]*models.Job),
 		chunkJobs:     make(map[string]*models.ChunkJob),
@@ -35,6 +36,7 @@ func NewJobManager(workerManager *WorkerManager, tempDir, outputDir string) *Job
 		videoChunker:  chunker.NewVideoChunkerByCount(1), // Will be updated per job
 		tempDir:       tempDir,
 		outputDir:     outputDir,
+		masterURL:     masterURL,
 	}
 }
 
@@ -102,51 +104,42 @@ func (jm *JobManager) processJob(job *models.Job) {
 		return
 	}
 
-	localWorkers, remoteWorkers := jm.categorizeWorkers(availableWorkers)
-	log.Printf("Found %d local workers, %d remote workers", len(localWorkers), len(remoteWorkers))
-
-	// Create temp directory for local chunks if we have local workers
-	var chunkDir string
-	var localChunks []chunker.Chunk
-
-	if len(localWorkers) > 0 {
-		chunkDir = filepath.Join(jm.tempDir, job.ID)
-		if err := os.MkdirAll(chunkDir, 0755); err != nil {
-			jm.failJob(job.ID, fmt.Sprintf("failed to create chunk directory: %v", err))
-			return
-		}
-
-		// Create physical chunks for local workers
-		localChunks, err = jm.videoChunker.SplitVideoByChunks(job.VideoPath, chunkDir, job.ID, len(localWorkers))
-		if err != nil {
-			jm.failJob(job.ID, fmt.Sprintf("failed to split video: %v", err))
-			return
-		}
-		log.Printf("Created %d physical chunks for local workers", len(localChunks))
+	// Create temp directory for chunks
+	chunkDir := filepath.Join(jm.tempDir, job.ID)
+	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+		jm.failJob(job.ID, fmt.Sprintf("failed to create chunk directory: %v", err))
+		return
 	}
 
-	// Calculate chunk duration for virtual chunks
-	chunkDuration := videoInfo.Duration / float64(job.TotalChunks)
+	// Create physical chunks for ALL workers (both local and remote)
+	chunks, err := jm.videoChunker.SplitVideoByChunks(job.VideoPath, chunkDir, job.ID, len(availableWorkers))
+	if err != nil {
+		jm.failJob(job.ID, fmt.Sprintf("failed to split video: %v", err))
+		return
+	}
+	log.Printf("Created %d chunks for %d workers", len(chunks), len(availableWorkers))
 
 	jm.mu.Lock()
 	chunkJobIDs := make([]string, 0, job.TotalChunks)
-	chunkIndex := 0
 
-	// Process local workers with physical chunks
-	for i, worker := range localWorkers {
-		if i >= len(localChunks) {
+	// Distribute chunks to workers
+	for i, worker := range availableWorkers {
+		if i >= len(chunks) {
 			break
 		}
 
-		chunk := localChunks[i]
-		encodedChunkPath := filepath.Join(chunkDir, fmt.Sprintf("%s_encoded_chunk_%03d.mp4", job.ID, chunkIndex))
+		chunk := chunks[i]
+		encodedChunkPath := filepath.Join(chunkDir, fmt.Sprintf("%s_encoded_chunk_%03d.mp4", job.ID, i))
+
+		// Determine if worker is local or remote
+		isRemote := !jm.isLocalWorker(worker.Worker)
 
 		chunkJob := &models.ChunkJob{
 			ID:              chunk.ID,
 			JobID:           job.ID,
-			ChunkIndex:      chunkIndex,
-			InputPath:       chunk.Path, // Physical chunk file
-			OutputPath:      encodedChunkPath,
+			ChunkIndex:      i,
+			InputPath:       chunk.Path,       // Physical chunk file path
+			OutputPath:      encodedChunkPath, // Where the encoded chunk should end up
 			WorkerID:        worker.Worker.ID,
 			Status:          models.ChunkStatusPending,
 			Progress:        0,
@@ -156,58 +149,19 @@ func (jm *JobManager) processJob(job *models.Job) {
 			SegmentStart:    chunk.Start,
 			SegmentDuration: chunk.Duration,
 			TotalDuration:   videoInfo.Duration,
-			IsRemoteWorker:  false,
+			IsRemoteWorker:  isRemote,
+			// Add server URL for remote workers to download chunks
+			MasterURL: jm.getMasterURL(),
 		}
 
 		jm.sendChunkJobToWorker(chunkJob, worker.Worker.ID, &chunkJobIDs)
-		chunkIndex++
-	}
-
-	// Process remote workers with virtual chunks
-	for _, worker := range remoteWorkers {
-		if chunkIndex >= job.TotalChunks {
-			break
-		}
-
-		segmentStart := float64(chunkIndex) * chunkDuration
-		segmentDuration := chunkDuration
-
-		// Adjust last chunk to include any remaining time
-		if chunkIndex == job.TotalChunks-1 {
-			segmentDuration = videoInfo.Duration - segmentStart
-		}
-
-		chunkID := fmt.Sprintf("%s_%03d", job.ID, chunkIndex)
-		outputPath := fmt.Sprintf("%s_remote_chunk_%03d.mp4", job.ID, chunkIndex)
-
-		chunkJob := &models.ChunkJob{
-			ID:              chunkID,
-			JobID:           job.ID,
-			ChunkIndex:      chunkIndex,
-			InputPath:       job.VideoPath, // Original video path
-			OutputPath:      outputPath,    // Worker will determine local output path
-			WorkerID:        worker.Worker.ID,
-			Status:          models.ChunkStatusPending,
-			Progress:        0,
-			StartTime:       time.Now(),
-			RetryCount:      0,
-			Settings:        job.Settings,
-			SegmentStart:    segmentStart,
-			SegmentDuration: segmentDuration,
-			TotalDuration:   videoInfo.Duration,
-			IsRemoteWorker:  true,
-		}
-
-		jm.sendChunkJobToWorker(chunkJob, worker.Worker.ID, &chunkJobIDs)
-		chunkIndex++
 	}
 
 	// Store chunk job IDs for this job
 	jm.jobChunks[job.ID] = chunkJobIDs
 	jm.mu.Unlock()
 
-	log.Printf("Distributed job %s to %d workers (%d local, %d remote)",
-		job.ID, len(chunkJobIDs), len(localWorkers), len(remoteWorkers))
+	log.Printf("Distributed job %s to %d workers", job.ID, len(chunkJobIDs))
 }
 
 // categorizeWorkers separates local and remote workers
@@ -342,23 +296,13 @@ func (jm *JobManager) mergeChunks(jobID string) {
 
 	log.Printf("Merging chunks for job %s", jobID)
 
-	// Collect encoded chunk paths in order and check availability
+	// Collect encoded chunk paths in order
 	chunkPaths := make([]string, len(chunkIDs))
 	missingChunks := make([]string, 0)
 
 	for _, chunkID := range chunkIDs {
 		chunkJob := jm.chunkJobs[chunkID]
 		chunkPath := chunkJob.OutputPath
-
-		if chunkJob.IsRemoteWorker {
-			// For remote workers, the output path might be relative to their working directory
-			// We need to construct the full path or handle file transfer
-			log.Printf("Remote worker chunk: %s -> %s", chunkID, chunkPath)
-
-			// For now, log this as a limitation
-			log.Printf("Warning: Remote worker chunks need to be accessible to master for merging")
-			log.Printf("Consider implementing file transfer or shared storage for chunk: %s", chunkPath)
-		}
 
 		// Check if chunk file exists
 		if _, err := os.Stat(chunkPath); os.IsNotExist(err) {
@@ -369,27 +313,9 @@ func (jm *JobManager) mergeChunks(jobID string) {
 		chunkPaths[chunkJob.ChunkIndex] = chunkPath
 	}
 
-	// If we have missing chunks, fail the job with detailed information
+	// If we have missing chunks, fail the job
 	if len(missingChunks) > 0 {
 		errorMsg := fmt.Sprintf("Cannot merge: %d chunks missing: %v", len(missingChunks), missingChunks)
-		if len(missingChunks) > 0 {
-			// Check if all missing chunks are from remote workers
-			allRemote := true
-			for _, chunkID := range chunkIDs {
-				chunkJob := jm.chunkJobs[chunkID]
-				if _, err := os.Stat(chunkJob.OutputPath); os.IsNotExist(err) {
-					if !chunkJob.IsRemoteWorker {
-						allRemote = false
-						break
-					}
-				}
-			}
-
-			if allRemote {
-				errorMsg += "\nNote: This appears to be due to remote worker chunks not being transferred back to master."
-				errorMsg += "\nConsider implementing shared storage or file transfer mechanism."
-			}
-		}
 		jm.failJob(jobID, errorMsg)
 		return
 	}
@@ -511,4 +437,9 @@ func (jm *JobManager) DeleteJob(jobID string) error {
 // generateJobID generates a unique job ID
 func generateJobID() string {
 	return fmt.Sprintf("job_%d", time.Now().UnixNano())
+}
+
+// getMasterURL returns the master URL
+func (jm *JobManager) getMasterURL() string {
+	return jm.masterURL
 }

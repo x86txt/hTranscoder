@@ -67,6 +67,7 @@ type ChunkJob struct {
 	SegmentDuration float64 `json:"segmentDuration"` // Duration in seconds
 	TotalDuration   float64 `json:"totalDuration"`   // Total video duration
 	IsRemoteWorker  bool    `json:"isRemoteWorker"`  // Whether this is for a remote worker
+	MasterURL       string  `json:"masterUrl"`       // Master server URL for downloading chunks
 }
 
 // WorkerMessage represents messages between master and workers

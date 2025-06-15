@@ -1,17 +1,20 @@
 package worker
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"hTranscode/internal/models"
@@ -26,6 +29,7 @@ type Client struct {
 	Name          string
 	ServerURL     string
 	conn          *websocket.Conn
+	connMutex     sync.RWMutex // Protects conn access
 	jobs          chan *models.ChunkJob
 	done          chan bool
 	MaxJobs       int
@@ -41,10 +45,10 @@ type Client struct {
 // NewClient creates a new worker client
 func NewClient(name, serverURL string, maxJobs int, gpu bool) *Client {
 	// Set retry interval based on operating system
-	// Windows needs longer retry intervals due to stricter socket management
+	// Windows needs much longer retry intervals due to stricter socket management
 	retryInterval := 2 * time.Second
 	if runtime.GOOS == "windows" {
-		retryInterval = 5 * time.Second
+		retryInterval = 10 * time.Second // Increased from 5 seconds
 	}
 
 	client := &Client{
@@ -74,8 +78,78 @@ func NewClient(name, serverURL string, maxJobs int, gpu bool) *Client {
 		}
 	}
 
-	// Create transcoder instance
-	client.transcoder = transcoder.NewTranscoder(client.GPU, client.GPUDevice)
+	// Create transcoder instance with GPU type detection
+	var gpuTypeForTranscoder string
+	if client.GPU {
+		if bestGPU, found := GetBestGPU(); found {
+			gpuTypeForTranscoder = string(bestGPU.Type)
+			log.Printf("GPU Type detected for transcoding: %s", gpuTypeForTranscoder)
+		}
+	}
+
+	client.transcoder = transcoder.NewTranscoderWithType(client.GPU, client.GPUDevice, gpuTypeForTranscoder)
+
+	// Ensure output directory exists
+	if err := os.MkdirAll(client.outputDir, 0755); err != nil {
+		log.Printf("Warning: Could not create output directory %s: %v", client.outputDir, err)
+	}
+
+	return client
+}
+
+// NewClientWithGPUType creates a new worker client with explicit GPU type
+func NewClientWithGPUType(name, serverURL string, maxJobs int, gpu bool, gpuType string) *Client {
+	// Set retry interval based on operating system
+	// Windows needs much longer retry intervals due to stricter socket management
+	retryInterval := 2 * time.Second
+	if runtime.GOOS == "windows" {
+		retryInterval = 10 * time.Second // Increased from 5 seconds
+	}
+
+	client := &Client{
+		ID:            fmt.Sprintf("worker_%d", time.Now().Unix()),
+		Name:          name,
+		ServerURL:     serverURL,
+		jobs:          make(chan *models.ChunkJob, maxJobs),
+		done:          make(chan bool),
+		MaxJobs:       maxJobs,
+		GPU:           gpu,
+		retryInterval: retryInterval,
+		maxRetries:    -1,             // Retry indefinitely
+		outputDir:     "./transcoded", // Default output directory
+	}
+
+	// Auto-detect GPU if not explicitly disabled
+	if !gpu && IsGPUAvailable() {
+		log.Println("GPU detected, enabling GPU encoding")
+		client.GPU = true
+
+		// Use primary GPU if no specific device specified
+		if client.GPUDevice == "" {
+			if bestGPU, found := GetBestGPU(); found {
+				client.GPUDevice = bestGPU.ID
+				log.Printf("Using primary GPU: %s (%s)", bestGPU.Name, bestGPU.Memory)
+			}
+		}
+	}
+
+	// Create transcoder instance with explicit or detected GPU type
+	var gpuTypeForTranscoder string
+	if client.GPU {
+		if gpuType != "" {
+			// Use explicitly provided GPU type
+			gpuTypeForTranscoder = gpuType
+			log.Printf("Using specified GPU type for transcoding: %s", gpuTypeForTranscoder)
+		} else {
+			// Auto-detect GPU type
+			if bestGPU, found := GetBestGPU(); found {
+				gpuTypeForTranscoder = string(bestGPU.Type)
+				log.Printf("GPU Type detected for transcoding: %s", gpuTypeForTranscoder)
+			}
+		}
+	}
+
+	client.transcoder = transcoder.NewTranscoderWithType(client.GPU, client.GPUDevice, gpuTypeForTranscoder)
 
 	// Ensure output directory exists
 	if err := os.MkdirAll(client.outputDir, 0755); err != nil {
@@ -121,23 +195,21 @@ func (c *Client) Connect() error {
 	}
 	u.Path = "/ws"
 
-	// Create HTTP transport with Windows-optimized settings
+	// Create HTTP transport for WebSocket upgrade
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true, // Accept self-signed certificates
 		},
-		// Windows-specific socket optimization
-		DisableKeepAlives:   false,
-		MaxIdleConns:        10,
-		MaxIdleConnsPerHost: 2,
-		IdleConnTimeout:     30 * time.Second,
+		MaxIdleConns:    10,
+		IdleConnTimeout: 30 * time.Second,
 	}
 
 	// For Windows, configure socket reuse options
 	if runtime.GOOS == "windows" {
-		transport.DisableKeepAlives = true // Disable keep-alives on Windows
-		transport.MaxIdleConns = 0         // Don't pool connections
-		transport.IdleConnTimeout = 1 * time.Second
+		// Don't disable keep-alives! This was causing connection drops
+		// Just reduce the pool size to avoid socket exhaustion
+		transport.MaxIdleConns = 5                   // Reduced pool size but still allow some pooling
+		transport.IdleConnTimeout = 30 * time.Second // Keep the same timeout as other platforms
 	}
 
 	// Create WebSocket dialer with optimized settings
@@ -163,11 +235,22 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
+	// Set connection with proper locking
+	c.connMutex.Lock()
 	c.conn = conn
+	c.connMutex.Unlock()
 
-	// Set connection timeouts and options
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	c.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	// Set initial connection timeouts - longer timeouts for stability
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute)) // 5 minute read timeout
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+
+	// Enable keep-alive at the WebSocket level
+	conn.SetPongHandler(func(string) error {
+		log.Println("Received pong from server")
+		// Refresh read deadline when we receive pong
+		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		return nil
+	})
 
 	// Determine GPU status
 	gpuStatus := GetGPUStatus()
@@ -191,7 +274,7 @@ func (c *Client) Connect() error {
 	}
 
 	log.Printf("Sending registration message: %+v", registration.Payload)
-	if err := c.conn.WriteJSON(registration); err != nil {
+	if err := conn.WriteJSON(registration); err != nil {
 		return fmt.Errorf("failed to register: %w", err)
 	}
 
@@ -215,6 +298,22 @@ func (c *Client) Start() error {
 		default:
 			if err := c.connectAndRun(); err != nil {
 				log.Printf("Connection lost: %v", err)
+
+				// Ensure connection is fully cleaned up before retry
+				c.connMutex.Lock()
+				if c.conn != nil {
+					c.conn.Close()
+					c.conn = nil
+				}
+				c.connMutex.Unlock()
+
+				// Windows-specific cleanup before retry
+				if runtime.GOOS == "windows" {
+					log.Printf("Windows detected - performing additional cleanup before retry")
+					runtime.GC()                // Force garbage collection
+					time.Sleep(2 * time.Second) // Additional cleanup time for Windows
+				}
+
 				log.Printf("Retrying connection in %v...", c.retryInterval)
 
 				// Wait for retry interval or shutdown signal
@@ -238,8 +337,11 @@ func (c *Client) connectAndRun() error {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
-	// Improved connection cleanup
+	// Improved connection cleanup with proper locking and Windows-specific handling
 	defer func() {
+		c.connMutex.Lock()
+		defer c.connMutex.Unlock()
+
 		if c.conn != nil {
 			// Send close message before closing connection
 			closeMessage := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
@@ -251,9 +353,10 @@ func (c *Client) connectAndRun() error {
 			c.conn.Close()
 			c.conn = nil
 
-			// On Windows, give additional time for socket cleanup
+			// On Windows, give additional time for socket cleanup and force garbage collection
 			if runtime.GOOS == "windows" {
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(1 * time.Second) // Increased from 500ms
+				runtime.GC()                // Force garbage collection to help with socket cleanup
 			}
 		}
 	}()
@@ -267,7 +370,13 @@ func (c *Client) connectAndRun() error {
 	defer func() {
 		// Signal heartbeat to stop by closing the channel
 		close(heartbeatDone)
+		// Give heartbeat time to stop
+		time.Sleep(100 * time.Millisecond)
 	}()
+
+	// Create a ticker to refresh read deadline periodically
+	refreshTicker := time.NewTicker(2 * time.Minute)
+	defer refreshTicker.Stop()
 
 	// Read messages from server
 	for {
@@ -275,19 +384,51 @@ func (c *Client) connectAndRun() error {
 		case <-c.done:
 			log.Println("Worker shutdown requested during message loop")
 			return nil
+		case <-refreshTicker.C:
+			// Periodically refresh read deadline to keep connection alive
+			c.connMutex.RLock()
+			conn := c.conn
+			c.connMutex.RUnlock()
+
+			if conn != nil {
+				conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+				log.Println("Refreshed connection read deadline")
+			}
 		default:
-			// Set read deadline for each message
-			c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			// Get connection safely
+			c.connMutex.RLock()
+			conn := c.conn
+			c.connMutex.RUnlock()
+
+			if conn == nil {
+				log.Println("Connection is nil, exiting message loop")
+				return fmt.Errorf("connection lost")
+			}
+
+			// Set a shorter read deadline for message reading
+			conn.SetReadDeadline(time.Now().Add(70 * time.Second))
 
 			var msg models.WorkerMessage
-			if err := c.conn.ReadJSON(&msg); err != nil {
+			if err := conn.ReadJSON(&msg); err != nil {
 				// Check if it's a close error (normal shutdown)
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					log.Println("Connection closed normally")
 					return nil
 				}
+
+				// Check if it's a timeout - these are expected
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					log.Println("Read timeout, refreshing connection")
+					// Refresh read deadline and continue
+					conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+					continue
+				}
+
 				return fmt.Errorf("read error: %w", err)
 			}
+
+			// Refresh read deadline after successfully reading a message
+			conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
 			log.Printf("Received message from server: type=%s", msg.Type)
 
@@ -328,11 +469,16 @@ func (c *Client) connectAndRun() error {
 				}
 
 				// Set write deadline before sending pong
-				c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				c.connMutex.RLock()
+				currentConn := c.conn
+				c.connMutex.RUnlock()
 
-				if err := c.conn.WriteJSON(pong); err != nil {
-					log.Printf("Failed to send pong: %v", err)
-					return fmt.Errorf("failed to send pong: %w", err)
+				if currentConn != nil {
+					currentConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+					if err := currentConn.WriteJSON(pong); err != nil {
+						log.Printf("Failed to send pong: %v", err)
+						return fmt.Errorf("failed to send pong: %w", err)
+					}
 				}
 
 			case "shutdown":
@@ -362,16 +508,8 @@ func (c *Client) processJobs() {
 		var outputPath string
 
 		if job.IsRemoteWorker {
-			// Virtual chunk: extract segment from original video
-			log.Printf("Processing virtual chunk %d (%.2fs-%.2fs) from %s",
-				job.ChunkIndex, job.SegmentStart, job.SegmentStart+job.SegmentDuration, job.InputPath)
-
-			// Check if original video exists (might be a shared path or URL)
-			if _, err := os.Stat(job.InputPath); os.IsNotExist(err) {
-				log.Printf("Original video file does not exist: %s", job.InputPath)
-				c.sendJobStatus(job, models.ChunkStatusFailed, 0, "Original video file not found")
-				continue
-			}
+			// Remote worker: download chunk from master
+			log.Printf("Remote worker - downloading chunk %d from master", job.ChunkIndex)
 
 			// Create local temp directory for this chunk
 			tempDir := filepath.Join(c.outputDir, "temp", job.JobID)
@@ -381,19 +519,19 @@ func (c *Client) processJobs() {
 				continue
 			}
 
-			// Extract the segment using FFmpeg
-			segmentFile := filepath.Join(tempDir, fmt.Sprintf("segment_%03d.mp4", job.ChunkIndex))
-			if err := c.extractSegment(job.InputPath, segmentFile, job.SegmentStart, job.SegmentDuration); err != nil {
-				log.Printf("Failed to extract segment: %v", err)
-				c.sendJobStatus(job, models.ChunkStatusFailed, 0, fmt.Sprintf("Failed to extract segment: %v", err))
+			// Download chunk from master
+			chunkFile := filepath.Join(tempDir, fmt.Sprintf("chunk_%03d.mp4", job.ChunkIndex))
+			if err := c.downloadChunk(job, chunkFile); err != nil {
+				log.Printf("Failed to download chunk: %v", err)
+				c.sendJobStatus(job, models.ChunkStatusFailed, 0, fmt.Sprintf("Failed to download chunk: %v", err))
 				continue
 			}
 
-			inputPath = segmentFile
-			outputPath = filepath.Join(c.outputDir, job.OutputPath)
+			inputPath = chunkFile
+			outputPath = filepath.Join(tempDir, fmt.Sprintf("encoded_chunk_%03d.mp4", job.ChunkIndex))
 		} else {
-			// Physical chunk: use provided chunk file
-			log.Printf("Processing physical chunk from %s", job.InputPath)
+			// Local worker: use provided chunk file path
+			log.Printf("Local worker - processing chunk from %s", job.InputPath)
 
 			// Check if input file exists
 			if _, err := os.Stat(job.InputPath); os.IsNotExist(err) {
@@ -449,42 +587,31 @@ func (c *Client) processJobs() {
 			log.Printf("Transcoding completed: %s (%.2f MB)", outputPath, float64(stat.Size())/(1024*1024))
 		}
 
-		// Clean up temporary segment file for virtual chunks
-		if job.IsRemoteWorker && inputPath != job.InputPath {
+		// For remote workers, upload the processed chunk back to master
+		if job.IsRemoteWorker {
+			log.Printf("Uploading processed chunk back to master")
+			if err := c.uploadChunk(job, outputPath); err != nil {
+				log.Printf("Failed to upload chunk: %v", err)
+				c.sendJobStatus(job, models.ChunkStatusFailed, 0, fmt.Sprintf("Failed to upload chunk: %v", err))
+				continue
+			}
+		}
+
+		// Clean up temporary files for remote workers
+		if job.IsRemoteWorker {
+			// Clean up downloaded chunk
 			if err := os.Remove(inputPath); err != nil {
-				log.Printf("Warning: failed to clean up temp file %s: %v", inputPath, err)
+				log.Printf("Warning: failed to clean up input file %s: %v", inputPath, err)
+			}
+			// Clean up encoded chunk (already uploaded)
+			if err := os.Remove(outputPath); err != nil {
+				log.Printf("Warning: failed to clean up output file %s: %v", outputPath, err)
 			}
 		}
 
 		// Mark as completed
 		c.sendJobStatus(job, models.ChunkStatusCompleted, 100, outputPath)
 	}
-}
-
-// extractSegment extracts a time segment from a video using FFmpeg
-func (c *Client) extractSegment(inputPath, outputPath string, startTime, duration float64) error {
-	// Use FFmpeg to extract the segment
-	// -ss: start time, -t: duration, -c copy: avoid re-encoding during extraction
-	args := []string{
-		"-i", inputPath,
-		"-ss", fmt.Sprintf("%.2f", startTime),
-		"-t", fmt.Sprintf("%.2f", duration),
-		"-c", "copy", // Copy streams to avoid quality loss during segmentation
-		"-avoid_negative_ts", "make_zero",
-		"-y", // Overwrite output file
-		outputPath,
-	}
-
-	cmd := exec.Command("ffmpeg", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ffmpeg segment extraction failed: %w\nOutput: %s", err, string(output))
-	}
-
-	log.Printf("Extracted segment: %.2fs-%.2fs from %s to %s",
-		startTime, startTime+duration, filepath.Base(inputPath), filepath.Base(outputPath))
-
-	return nil
 }
 
 // Helper functions to extract encoding parameters from job
@@ -523,7 +650,11 @@ func getPresetFromJob(job *models.ChunkJob) string {
 
 // sendJobStatus sends job status update to the master server
 func (c *Client) sendJobStatus(job *models.ChunkJob, status string, progress int, error string) {
-	if c.conn == nil {
+	c.connMutex.RLock()
+	conn := c.conn
+	c.connMutex.RUnlock()
+
+	if conn == nil {
 		log.Printf("Cannot send job status: connection is nil")
 		return
 	}
@@ -542,23 +673,32 @@ func (c *Client) sendJobStatus(job *models.ChunkJob, status string, progress int
 	}
 
 	// Set write deadline
-	c.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
-	if err := c.conn.WriteJSON(update); err != nil {
+	if err := conn.WriteJSON(update); err != nil {
 		log.Printf("Failed to send job status: %v", err)
 	}
 }
 
 // heartbeat sends periodic heartbeat messages to the server with latency tracking
 func (c *Client) heartbeat(done chan bool) {
-	ticker := time.NewTicker(250 * time.Millisecond)
+	// Use a reasonable heartbeat frequency - 5 seconds
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
+	// Also send WebSocket pings for keep-alive
+	pingTicker := time.NewTicker(45 * time.Second)
+	defer pingTicker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			// Check if connection is still valid
-			if c.conn == nil {
+			// Check if connection is still valid with proper locking
+			c.connMutex.RLock()
+			conn := c.conn
+			c.connMutex.RUnlock()
+
+			if conn == nil {
 				log.Println("Heartbeat stopping: connection is nil")
 				return
 			}
@@ -584,12 +724,34 @@ func (c *Client) heartbeat(done chan bool) {
 			}
 
 			// Set write deadline before sending heartbeat
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
-			if err := c.conn.WriteJSON(status); err != nil {
+			if err := conn.WriteJSON(status); err != nil {
 				log.Printf("Failed to send heartbeat: %v", err)
 				return
 			}
+
+			// Don't log successful heartbeats to avoid spam (every 5 seconds)
+
+		case <-pingTicker.C:
+			// Send WebSocket ping for keep-alive
+			c.connMutex.RLock()
+			conn := c.conn
+			c.connMutex.RUnlock()
+
+			if conn == nil {
+				log.Println("Ping stopping: connection is nil")
+				return
+			}
+
+			// Send WebSocket ping
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+				log.Printf("Failed to send ping: %v", err)
+				return
+			}
+
+			// Don't log successful pings to avoid spam
 
 		case <-done:
 			log.Println("Heartbeat stopping due to connection close")
@@ -605,7 +767,155 @@ func (c *Client) heartbeat(done chan bool) {
 func (c *Client) Stop() {
 	close(c.done)
 	close(c.jobs)
+
+	// Close connection with proper locking
+	c.connMutex.Lock()
 	if c.conn != nil {
 		c.conn.Close()
+		c.conn = nil
 	}
+	c.connMutex.Unlock()
+}
+
+// insecureHTTPClient creates an http.Client that skips TLS certificate verification.
+// This is necessary for connecting to a master with a self-signed certificate.
+func (c *Client) insecureHTTPClient() *http.Client {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Skip verification
+		},
+		MaxIdleConns:    10,
+		IdleConnTimeout: 30 * time.Second,
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Minute, // Increased timeout for large chunk transfers
+	}
+}
+
+// downloadChunk downloads a chunk file from the master server
+func (c *Client) downloadChunk(job *models.ChunkJob, destPath string) error {
+	// Construct download URL
+	downloadURL := fmt.Sprintf("%s/api/chunks/%s/%s/download", job.MasterURL, job.JobID, job.ID)
+
+	log.Printf("Downloading chunk from: %s", downloadURL)
+
+	// Create HTTP client that trusts self-signed certs
+	client := c.insecureHTTPClient()
+
+	// Create request
+	req, err := http.NewRequest("GET", downloadURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("download request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("download failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Create destination file
+	destFile, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %w", err)
+	}
+	defer destFile.Close()
+
+	// Copy response body to file
+	written, err := io.Copy(destFile, resp.Body)
+	if err != nil {
+		os.Remove(destPath) // Clean up on error
+		return fmt.Errorf("failed to save chunk: %w", err)
+	}
+
+	log.Printf("Downloaded chunk successfully: %d bytes", written)
+	return nil
+}
+
+// uploadChunk uploads a processed chunk back to the master server
+func (c *Client) uploadChunk(job *models.ChunkJob, chunkPath string) error {
+	// Open the chunk file
+	file, err := os.Open(chunkPath)
+	if err != nil {
+		return fmt.Errorf("failed to open chunk file: %w", err)
+	}
+	defer file.Close()
+
+	// Get file info
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	// Create multipart form
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	// Add file to form
+	part, err := writer.CreateFormFile("chunkFile", filepath.Base(chunkPath))
+	if err != nil {
+		return fmt.Errorf("failed to create form file: %w", err)
+	}
+
+	// Copy file content to form
+	if _, err := io.Copy(part, file); err != nil {
+		return fmt.Errorf("failed to copy file to form: %w", err)
+	}
+
+	// Close the writer to finalize the form
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	// Construct upload URL
+	uploadURL := fmt.Sprintf("%s/api/chunks/%s/%s/upload", job.MasterURL, job.JobID, job.ID)
+
+	log.Printf("Uploading chunk to: %s (size: %d bytes)", uploadURL, fileInfo.Size())
+
+	// Create HTTP client that trusts self-signed certs
+	client := c.insecureHTTPClient()
+
+	// Create request
+	req, err := http.NewRequest("POST", uploadURL, body)
+	if err != nil {
+		return fmt.Errorf("failed to create upload request: %w", err)
+	}
+
+	// Set content type
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Parse response
+	var uploadResp map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
+		return fmt.Errorf("failed to parse upload response: %w", err)
+	}
+
+	if success, ok := uploadResp["success"].(bool); !ok || !success {
+		return fmt.Errorf("upload failed: %v", uploadResp["message"])
+	}
+
+	log.Printf("Uploaded chunk successfully")
+	return nil
 }

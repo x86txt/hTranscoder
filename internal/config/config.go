@@ -335,10 +335,10 @@ func getLocalIPAddresses() ([]net.IP, error) {
 // SetupTLS configures TLS for the server
 func (c *Config) SetupTLS() (*tls.Config, error) {
 	if !c.TLS.Enabled {
-		return nil, nil
+		return nil, fmt.Errorf("TLS is not enabled")
 	}
 
-	// Generate certificate if auto-generate is enabled and files don't exist
+	// Generate certificate if needed
 	if c.TLS.AutoGenerate {
 		if _, err := os.Stat(c.TLS.CertFile); os.IsNotExist(err) {
 			if err := c.GenerateSelfSignedCert(); err != nil {
@@ -347,32 +347,43 @@ func (c *Config) SetupTLS() (*tls.Config, error) {
 		}
 	}
 
-	// Load certificate and key
+	// Load certificate
 	cert, err := tls.LoadX509KeyPair(c.TLS.CertFile, c.TLS.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load certificate: %w", err)
 	}
 
+	// Browser-compatible TLS configuration
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13, // TLS 1.3 minimum for enhanced security
-		MaxVersion:   tls.VersionTLS13, // Force TLS 1.3 only
+		MinVersion:   tls.VersionTLS12, // Allow TLS 1.2 for broader compatibility
+		MaxVersion:   tls.VersionTLS13, // Up to TLS 1.3
+
+		// Browser-compatible cipher suites (TLS 1.2 + 1.3)
 		CipherSuites: []uint16{
-			// TLS 1.3 cipher suites (these are the only secure ones)
-			tls.TLS_AES_128_GCM_SHA256,
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
+			// TLS 1.2 cipher suites (for browser compatibility)
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
 		},
+
+		// TLS 1.3 cipher suites (automatically used for TLS 1.3)
+		// These don't need to be specified as they're defaults for TLS 1.3
+
 		CurvePreferences: []tls.CurveID{
-			tls.X25519, // Modern elliptic curve (faster than P-256)
+			tls.X25519, // Modern elliptic curve
 			tls.CurveP256,
 			tls.CurveP384,
 		},
+
+		// Enable HTTP/2 explicitly
+		NextProtos: []string{"h2", "http/1.1"},
+
+		// Improve compatibility
 		PreferServerCipherSuites: true,
-		NextProtos: []string{
-			"h2",       // HTTP/2
-			"http/1.1", // HTTP/1.1 fallback
-		},
 	}
 
 	return tlsConfig, nil
@@ -390,7 +401,12 @@ func (c *Config) GetServerURL() string {
 		if c.Server.Host != "" {
 			host = c.Server.Host
 		} else {
-			host = "localhost"
+			// Auto-detect default route interface IP
+			if ip := getDefaultRouteIP(); ip != "" {
+				host = ip
+			} else {
+				host = "localhost"
+			}
 		}
 	}
 
@@ -400,4 +416,16 @@ func (c *Config) GetServerURL() string {
 	}
 
 	return fmt.Sprintf("%s://%s:%d", scheme, host, port)
+}
+
+// getDefaultRouteIP returns the IP address of the interface used for the default route
+func getDefaultRouteIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
 }

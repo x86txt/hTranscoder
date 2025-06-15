@@ -17,18 +17,49 @@ import (
 	"hTranscode/pkg/worker"
 )
 
+const Version = "0.1.0-alpha"
+
 func main() {
 	var (
-		name      = flag.String("name", "", "Worker name")
-		serverURL = flag.String("server", "", "Master server URL (optional if using discovery)")
-		maxJobs   = flag.Int("jobs", 2, "Maximum concurrent jobs")
-		useGPU    = flag.Bool("gpu", false, "Force enable GPU encoding")
-		noGPU     = flag.Bool("no-gpu", false, "Disable GPU encoding (even if available)")
-		gpuDevice = flag.String("gpu-device", "", "GPU device to use (e.g., 0)")
-		keyFile   = flag.String("key", ".htranscode.key", "Secret key file path")
-		discover  = flag.Bool("discover", true, "Use auto-discovery to find server")
+		name        = flag.String("name", "", "Worker name (default: auto-generated). Example: --name=worker1")
+		serverURL   = flag.String("server", "", "Master server URL (optional if using discovery). Example: --server=https://192.168.1.10:8080")
+		maxJobs     = flag.Int("jobs", 2, "Maximum concurrent jobs this worker can process. Example: --jobs=4")
+		useGPU      = flag.Bool("gpu", false, "Force enable GPU encoding (overrides auto-detect). Example: --gpu")
+		noGPU       = flag.Bool("no-gpu", false, "Disable GPU encoding, even if available. Example: --no-gpu")
+		gpuDevice   = flag.String("gpu-device", "", "GPU device to use (e.g., 0). Example: --gpu-device=1")
+		gpuType     = flag.String("gpu-type", "", "Force GPU type: nvidia, amd, apple, intel. Example: --gpu-type=nvidia")
+		keyFile     = flag.String("key", ".htranscode.key", "Secret key file path. Example: --key=/etc/htranscode.key")
+		discover    = flag.Bool("discover", true, "Use auto-discovery to find server (default: true). Example: --discover=false")
+		helpFlag    = flag.Bool("help", false, "Show this help message and exit.")
+		versionFlag = flag.Bool("version", false, "Show version information and exit.")
 	)
 	flag.Parse()
+
+	if *helpFlag {
+		fmt.Printf("hTranscode Worker (version %s)\n", Version)
+		fmt.Println("\nDistributed video transcoding worker. Connects to the master server, receives chunk jobs, and performs encoding using CPU or GPU.")
+		fmt.Println("\nUsage:")
+		fmt.Println("  htranscode-worker --name=NAME --server=URL --jobs=N [other options]")
+		fmt.Println("\nFlags:")
+		fmt.Println("  --name        Worker name (default: auto-generated)")
+		fmt.Println("  --server      Master server URL (optional if using discovery)")
+		fmt.Println("  --jobs        Maximum concurrent jobs (default: 2)")
+		fmt.Println("  --gpu         Force enable GPU encoding")
+		fmt.Println("  --no-gpu      Disable GPU encoding, even if available")
+		fmt.Println("  --gpu-device  GPU device to use (e.g., 0)")
+		fmt.Println("  --gpu-type    Force GPU type: nvidia, amd, apple, intel")
+		fmt.Println("  --key         Secret key file path (default: .htranscode.key)")
+		fmt.Println("  --discover    Use auto-discovery to find server (default: true)")
+		fmt.Println("  --help        Show this help message and exit")
+		fmt.Println("  --version     Show version information and exit")
+		fmt.Println("\nExample:")
+		fmt.Println("  ./htranscode-worker --name=worker1 --server=https://192.168.1.10:8080 --jobs=4 --gpu")
+		os.Exit(0)
+	}
+	if *versionFlag {
+		fmt.Printf("hTranscode Worker version %s\n", Version)
+		os.Exit(0)
+	}
 
 	// Load secret key
 	secretKey, err := loadSecretKey(*keyFile)
@@ -75,7 +106,25 @@ func main() {
 		// Auto-detect GPU if not explicitly disabled or enabled
 		if worker.IsGPUAvailable() {
 			enableGPU = true
-			log.Println("GPU detected and will be used for encoding")
+			// Log detected GPUs
+			if gpus, err := worker.DetectGPUs(); err == nil && len(gpus) > 0 {
+				log.Printf("Detected %d GPU(s):", len(gpus))
+				for i, gpu := range gpus {
+					log.Printf("  [%d] %s %s (%s) - Type: %s", i, gpu.Name, gpu.Memory,
+						func() string {
+							if gpu.IsPrimary {
+								return "Primary"
+							}
+							return "Secondary"
+						}(), gpu.Type)
+				}
+
+				if bestGPU, found := worker.GetBestGPU(); found {
+					log.Printf("Selected GPU for encoding: %s (%s)", bestGPU.Name, bestGPU.Type)
+				}
+			} else {
+				log.Println("GPU detected and will be used for encoding")
+			}
 		} else {
 			log.Println("No GPU detected, using CPU encoding")
 		}
@@ -84,10 +133,13 @@ func main() {
 		log.Println("GPU encoding disabled by user")
 	} else if *useGPU {
 		log.Println("GPU encoding forced by user")
+		if *gpuType != "" {
+			log.Printf("Forced GPU type: %s", *gpuType)
+		}
 	}
 
 	// Create worker client
-	client := worker.NewClient(*name, finalServerURL, *maxJobs, enableGPU)
+	client := worker.NewClientWithGPUType(*name, finalServerURL, *maxJobs, enableGPU, *gpuType)
 	if *gpuDevice != "" {
 		if worker.ValidateGPUDevice(*gpuDevice) {
 			client.GPUDevice = *gpuDevice
@@ -99,6 +151,7 @@ func main() {
 
 	// Start worker (handles connection automatically)
 	log.Printf("Starting worker '%s'...", *name)
+	fmt.Printf("hTranscode Worker version %s\n", Version)
 
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)

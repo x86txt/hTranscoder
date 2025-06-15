@@ -31,6 +31,9 @@ bin/tailwind/tailwindcss
 # Generated CSS files
 cmd/static/styles.css
 
+# Embedded template copies (templates are embedded in binary)
+cmd/api/templates/
+
 # IDE specific files
 .vscode/
 .idea/

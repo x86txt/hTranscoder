@@ -28,16 +28,12 @@
                                class="hidden"
                                accept=".mp4,.avi,.mkv,.mov,.flv,.wmv,.webm,.m4v,.3gp"
                                multiple
-                               onchange="updateFileInputDisplay()">
+                               onchange="updateFileInputDisplay(); uploadFiles();">
                         <button onclick="document.getElementById('videoUpload').click()" 
                                 class="input flex items-center justify-center w-full cursor-pointer hover:bg-zinc-800 transition-colors">
                             <span id="fileInputText" class="text-zinc-400">Choose video files...</span>
                         </button>
                     </div>
-                    <button onclick="uploadFiles()" 
-                            class="button button-primary h-10 px-4">
-                        Upload
-                    </button>
                 </div>
                 <p class="text-sm text-muted-foreground mt-2">
                     Select video files from your computer to upload. Max size: <span id="maxUploadSize">2GB</span> per file.
@@ -1339,9 +1335,13 @@
                             
                             // Show results
                             if (failedUploads.length === 0) {
-                                alert(`Successfully uploaded ${uploadedFiles} file(s)!`);
+                                showFireworks();
+                            } else if (uploadedFiles > 0) {
+                                showFireworks();
+                                // Optionally, show a non-intrusive error for failed files
+                                showUploadError(`Some files failed: ${failedUploads.join(', ')}`);
                             } else {
-                                alert(`Uploaded ${uploadedFiles} file(s). Failed: ${failedUploads.join(', ')}`);
+                                showUploadError(`Failed: ${failedUploads.join(', ')}`);
                             }
                             
                             // Auto-refresh uploads if currently viewing them
@@ -1503,6 +1503,79 @@
             // Update modal live data every second for real-time Last Ping updates
             setInterval(updateModalLiveData, 1000);
         };
+
+        // Add showFireworks() and showUploadError() JS functions at the end of the script
+        function showFireworks() {
+            // Create a canvas overlay
+            let canvas = document.createElement('canvas');
+            canvas.id = 'fireworksCanvas';
+            canvas.style.position = 'fixed';
+            canvas.style.left = 0;
+            canvas.style.top = 0;
+            canvas.style.width = '100vw';
+            canvas.style.height = '100vh';
+            canvas.style.pointerEvents = 'none';
+            canvas.style.zIndex = 9999;
+            document.body.appendChild(canvas);
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            // Simple fireworks animation (burst effect)
+            let ctx = canvas.getContext('2d');
+            let particles = [];
+            let colors = ['#ff595e','#ffca3a','#8ac926','#1982c4','#6a4c93'];
+            for (let i = 0; i < 60; i++) {
+                let angle = (Math.PI * 2) * (i / 60);
+                let speed = Math.random() * 6 + 4;
+                particles.push({
+                    x: canvas.width/2,
+                    y: canvas.height/2,
+                    vx: Math.cos(angle) * speed,
+                    vy: Math.sin(angle) * speed,
+                    alpha: 1,
+                    color: colors[Math.floor(Math.random()*colors.length)]
+                });
+            }
+            let frame = 0;
+            function animate() {
+                ctx.clearRect(0,0,canvas.width,canvas.height);
+                for (let p of particles) {
+                    ctx.globalAlpha = p.alpha;
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, 4, 0, Math.PI*2);
+                    ctx.fillStyle = p.color;
+                    ctx.fill();
+                    p.x += p.vx;
+                    p.y += p.vy;
+                    p.vx *= 0.96;
+                    p.vy *= 0.96;
+                    p.alpha *= 0.96;
+                }
+                ctx.globalAlpha = 1;
+                frame++;
+                if (frame < 60) {
+                    requestAnimationFrame(animate);
+                } else {
+                    document.body.removeChild(canvas);
+                }
+            }
+            animate();
+        }
+        function showUploadError(msg) {
+            let err = document.createElement('div');
+            err.textContent = msg;
+            err.style.position = 'fixed';
+            err.style.bottom = '32px';
+            err.style.left = '50%';
+            err.style.transform = 'translateX(-50%)';
+            err.style.background = 'rgba(220,38,38,0.95)';
+            err.style.color = '#fff';
+            err.style.padding = '12px 24px';
+            err.style.borderRadius = '8px';
+            err.style.fontSize = '1rem';
+            err.style.zIndex = 10000;
+            document.body.appendChild(err);
+            setTimeout(()=>{ err.remove(); }, 3500);
+        }
     </script>
 </body>
 </html> 
